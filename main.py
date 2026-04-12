@@ -177,14 +177,13 @@ async def _handle_file_upload(
                 source, unique_id, status_msg, link)
 
     reply_text = (
-        f"✅ *File Saved Successfully*\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"🆔 *Unique ID:* `{unique_id}`\n"
-        f"📊 *Status:* {status_msg}\n\n"
-        f"🔗 *Permanent Link:*\n"
+        f"✅ *File Saved!*\n\n"
+        f"🆔 *Unique ID*\n"
+        f"`{unique_id}`\n\n"
+        f"📊 *Status:* _{status_msg}_\n\n"
+        f"🔗 *Permanent Link*\n"
         f"{link}\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"_Share the link above to give access to this file._"
+        f"💡 _Share this link to give access to the file._"
     )
 
     if update.message:
@@ -220,8 +219,8 @@ async def send_file_with_fallback(
         logger.warning("[DELIVERY] unique_id=%s not found | user_id=%s", unique_id, user_id)
         await update.message.reply_text(
             "❌ *File Not Found*\n\n"
-            "The file you requested does not exist or may have been removed.\n\n"
-            "_Please check the link and try again._",
+            "*This file does not exist or has been removed.*\n\n"
+            "_Double-check the link and try again._",
             parse_mode="Markdown",
         )
         return
@@ -232,8 +231,8 @@ async def send_file_with_fallback(
         logger.warning("[DELIVERY] unique_id=%s has no file_ids | user_id=%s", unique_id, user_id)
         await update.message.reply_text(
             "⚠️ *File Unavailable*\n\n"
-            "This file currently has no available sources.\n"
-            "Please contact the admin for assistance.",
+            "*No sources are currently available for this file.*\n\n"
+            "_Please contact the admin for assistance._",
             parse_mode="Markdown",
         )
         return
@@ -266,10 +265,9 @@ async def send_file_with_fallback(
             notice_msg = await context.bot.send_message(
                 chat_id=chat_id,
                 text=(
-                    "⏳ *Auto-Delete Notice*\n\n"
-                    "This file will be automatically deleted from this chat "
-                    "in *10 minutes* for security purposes.\n\n"
-                    "_Save it before the timer runs out!_"
+                    "⏳ *Auto-Delete Active*\n\n"
+                    "*This file will be deleted in 10 minutes.*\n\n"
+                    "_Save it now before the timer runs out!_"
                 ),
                 parse_mode="Markdown",
             )
@@ -331,10 +329,10 @@ async def send_file_with_fallback(
             unique_id, user_id,
         )
         await update.message.reply_text(
-            "❌ *File Unavailable*\n\n"
-            "We were unable to deliver this file at the moment.\n"
-            "All sources have been exhausted.\n\n"
-            "Please contact the admin or try again later.",
+            "❌ *Delivery Failed*\n\n"
+            "*Unable to deliver this file right now.*\n\n"
+            "_All backup sources have been exhausted._\n"
+            "_Please contact the admin or try again later._",
             parse_mode="Markdown",
         )
 
@@ -357,9 +355,9 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         # 1. Rate limit check
         if _is_rate_limited(user_id):
             await update.message.reply_text(
-                "⚠️ *Too Many Requests*\n\n"
-                "You are sending requests too quickly.\n"
-                "Please wait a moment and try again.",
+                "⚠️ *Slow Down!*\n\n"
+                "*You are sending requests too quickly.*\n\n"
+                "_Please wait a moment and try again._",
                 parse_mode="Markdown"
             )
             return
@@ -379,13 +377,11 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     # ── Plain /start ──────────────────────────────────────────────────────────
     upsert_user(user_id, first_name=user.first_name or "")
     await update.message.reply_text(
-        f"👋 Welcome, {user.first_name}!\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🤖 *File Hub Bot*\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"I can securely deliver files to you via permanent links.\n\n"
-        f"📎 Simply open a file link and I'll send it directly here.\n\n"
-        f"_Powered by File Hub_",
+        f"👋 *Hey {user.first_name}!*\n\n"
+        f"🤖 *File Hub Bot*\n\n"
+        f"📂 I securely store and deliver files via permanent links.\n\n"
+        f"📎 Just open a file link and I will send it directly to you here.\n\n"
+        f"🔒 _Files are auto-deleted after 10 minutes for your privacy._",
         parse_mode="Markdown",
     )
     logger.info("[USER] /start from user_id=%s", user_id)
@@ -400,7 +396,7 @@ async def upload_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         logger.warning("[SECURITY] Unauthorized upload attempt from user_id=%s", user.id)
         await update.message.reply_text(
             "🚫 *Access Denied*\n\n"
-            "You are not authorized to upload files.\n"
+            "*You are not authorized to upload files.*\n\n"
             "_Only admins can use this feature._",
             parse_mode="Markdown",
         )
