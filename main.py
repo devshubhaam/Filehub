@@ -30,6 +30,7 @@ from telegram.ext import (
 )
 
 from db import (
+    track_click,
     init_db,
     save_file,
     get_file,
@@ -161,7 +162,8 @@ async def _handle_file_upload(
     """
     unique_id  = extract_unique_id(caption)
     result     = save_file(unique_id, file_id)
-    link       = generate_link(unique_id, BOT_USERNAME)
+    # Use domain redirect URL — bot can be swapped by changing BOT_USERNAME in .env
+    link       = f"{WEBHOOK_URL}/file/{unique_id}"
 
     status_map = {
         "inserted": "New file saved",
@@ -382,6 +384,134 @@ def webhook() -> Response:
         logger.error("Failed to process update: %s", exc)
 
     return jsonify({"ok": True}), 200
+
+
+
+# ─── Redirect Route ───────────────────────────────────────────────────────────
+
+@flask_app.get("/file/<unique_id>")
+def file_redirect(unique_id: str) -> Response:
+    """
+    Public redirect endpoint: /file/<unique_id>
+
+    Flow:
+      1. Anti-bot check (User-Agent required)
+      2. Track click in MongoDB
+      3. Return countdown HTML page that auto-redirects to Telegram deep-link
+    """
+    from flask import make_response
+
+    user_agent = request.headers.get("User-Agent")
+    ip         = request.remote_addr
+
+    # 1. Anti-bot protection — block requests with no User-Agent
+    if not user_agent:
+        logger.warning("[REDIRECT] Blocked no-UA request | unique_id=%s | ip=%s", unique_id, ip)
+        return make_response("Access denied", 403)
+
+    # 2. Build Telegram deep-link dynamically from BOT_USERNAME
+    tg_link = f"https://t.me/{BOT_USERNAME}?start=file_{unique_id}"
+
+    logger.info(
+        "[REDIRECT] Click received | unique_id=%s | ip=%s | bot=%s",
+        unique_id, ip, BOT_USERNAME,
+    )
+
+    # 3. Track click in MongoDB (non-blocking — errors are logged, not raised)
+    try:
+        track_click(unique_id, ip=ip, user_agent=user_agent)
+    except Exception as exc:
+        logger.error("[REDIRECT] click tracking failed: %s", exc)
+
+    logger.info("[REDIRECT] Redirecting -> %s", tg_link)
+
+    # 4. Return countdown/delay HTML page
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Opening File...</title>
+  <style>
+    * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+    body {{
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #0f0f1a;
+      color: #e0e0e0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+    }}
+    .card {{
+      text-align: center;
+      padding: 40px 32px;
+      background: #1a1a2e;
+      border-radius: 16px;
+      max-width: 360px;
+      width: 90%;
+      box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+    }}
+    .icon {{ font-size: 48px; margin-bottom: 16px; }}
+    h2 {{ font-size: 20px; margin-bottom: 8px; color: #ffffff; }}
+    p  {{ font-size: 14px; color: #888; margin-bottom: 24px; }}
+    .counter {{
+      font-size: 40px;
+      font-weight: 700;
+      color: #5b8dee;
+      margin-bottom: 20px;
+    }}
+    .bar-wrap {{
+      background: #2a2a3e;
+      border-radius: 8px;
+      overflow: hidden;
+      height: 6px;
+      margin-bottom: 24px;
+    }}
+    .bar {{
+      height: 100%;
+      background: linear-gradient(90deg, #5b8dee, #a855f7);
+      width: 100%;
+      animation: shrink 5s linear forwards;
+    }}
+    @keyframes shrink {{ from {{ width: 100%; }} to {{ width: 0%; }} }}
+    a.btn {{
+      display: inline-block;
+      padding: 12px 28px;
+      background: #5b8dee;
+      color: #fff;
+      border-radius: 8px;
+      text-decoration: none;
+      font-size: 15px;
+      font-weight: 600;
+    }}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="icon">📂</div>
+    <h2>Generating your link...</h2>
+    <p>You will be redirected to Telegram automatically.</p>
+    <div class="counter" id="count">5</div>
+    <div class="bar-wrap"><div class="bar"></div></div>
+    <a class="btn" href="{tg_link}">Open Now</a>
+  </div>
+  <script>
+    var count = 5;
+    var el    = document.getElementById("count");
+    var iv    = setInterval(function() {{
+      count--;
+      el.textContent = count;
+      if (count <= 0) {{
+        clearInterval(iv);
+        window.location.href = "{tg_link}";
+      }}
+    }}, 1000);
+  </script>
+</body>
+</html>"""
+
+    return make_response(html, 200)
 
 
 # ─── Startup ──────────────────────────────────────────────────────────────────
