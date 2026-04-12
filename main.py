@@ -11,6 +11,7 @@ Features:
 """
 
 import asyncio
+from datetime import datetime, timezone
 import logging
 import os
 import threading
@@ -176,14 +177,18 @@ async def _handle_file_upload(
                 source, unique_id, status_msg, link)
 
     reply_text = (
-        f"File saved successfully!\n\n"
-        f"Unique ID : {unique_id}\n"
-        f"Status    : {status_msg}\n\n"
-        f"Permanent Link:\n{link}"
+        f"✅ *File Saved Successfully*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🆔 *Unique ID:* `{unique_id}`\n"
+        f"📊 *Status:* {status_msg}\n\n"
+        f"🔗 *Permanent Link:*\n"
+        f"{link}\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"_Share the link above to give access to this file._"
     )
 
     if update.message:
-        await update.message.reply_text(reply_text)
+        await update.message.reply_text(reply_text, parse_mode="Markdown")
     elif update.channel_post:
         logger.info("[UPLOAD][channel] unique_id=%s | link=%s", unique_id, link)
 
@@ -213,14 +218,24 @@ async def send_file_with_fallback(
 
     if not doc:
         logger.warning("[DELIVERY] unique_id=%s not found | user_id=%s", unique_id, user_id)
-        await update.message.reply_text("File not found.")
+        await update.message.reply_text(
+            "❌ *File Not Found*\n\n"
+            "The file you requested does not exist or may have been removed.\n\n"
+            "_Please check the link and try again._",
+            parse_mode="Markdown",
+        )
         return
 
     file_ids: list[str] = list(doc.get("file_ids", []))
 
     if not file_ids:
         logger.warning("[DELIVERY] unique_id=%s has no file_ids | user_id=%s", unique_id, user_id)
-        await update.message.reply_text("File unavailable.")
+        await update.message.reply_text(
+            "⚠️ *File Unavailable*\n\n"
+            "This file currently has no available sources.\n"
+            "Please contact the admin for assistance.",
+            parse_mode="Markdown",
+        )
         return
 
     logger.info(
@@ -268,7 +283,11 @@ async def send_file_with_fallback(
             unique_id, user_id,
         )
         await update.message.reply_text(
-            "File is currently unavailable. Please contact admin."
+            "❌ *File Unavailable*\n\n"
+            "We were unable to deliver this file at the moment.\n"
+            "All sources have been exhausted.\n\n"
+            "Please contact the admin or try again later.",
+            parse_mode="Markdown",
         )
 
 
@@ -290,7 +309,10 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         # 1. Rate limit check
         if _is_rate_limited(user_id):
             await update.message.reply_text(
-                "Too many requests, slow down."
+                "⚠️ *Too Many Requests*\n\n"
+                "You are sending requests too quickly.\n"
+                "Please wait a moment and try again.",
+                parse_mode="Markdown"
             )
             return
 
@@ -308,7 +330,16 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     # ── Plain /start ──────────────────────────────────────────────────────────
     upsert_user(user_id, first_name=user.first_name or "")
-    await update.message.reply_text("Bot is running successfully!")
+    await update.message.reply_text(
+        f"👋 Welcome, {user.first_name}!\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🤖 *File Hub Bot*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"I can securely deliver files to you via permanent links.\n\n"
+        f"📎 Simply open a file link and I'll send it directly here.\n\n"
+        f"_Powered by File Hub_",
+        parse_mode="Markdown",
+    )
     logger.info("[USER] /start from user_id=%s", user_id)
 
 
@@ -319,7 +350,12 @@ async def upload_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # Strict admin check
     if not _is_admin(user.id):
         logger.warning("[SECURITY] Unauthorized upload attempt from user_id=%s", user.id)
-        await update.message.reply_text("You are not authorized to upload files.")
+        await update.message.reply_text(
+            "🚫 *Access Denied*\n\n"
+            "You are not authorized to upload files.\n"
+            "_Only admins can use this feature._",
+            parse_mode="Markdown",
+        )
         return
 
     msg     = update.message
@@ -389,6 +425,7 @@ def webhook() -> Response:
 
 # ─── Redirect Route ───────────────────────────────────────────────────────────
 
+
 @flask_app.get("/file/<unique_id>")
 def file_redirect(unique_id: str) -> Response:
     """
@@ -404,12 +441,11 @@ def file_redirect(unique_id: str) -> Response:
     user_agent = request.headers.get("User-Agent")
     ip         = request.remote_addr
 
-    # 1. Anti-bot protection — block requests with no User-Agent
+    # Anti-bot: block requests with no User-Agent
     if not user_agent:
         logger.warning("[REDIRECT] Blocked no-UA request | unique_id=%s | ip=%s", unique_id, ip)
         return make_response("Access denied", 403)
 
-    # 2. Build Telegram deep-link dynamically from BOT_USERNAME
     tg_link = f"https://t.me/{BOT_USERNAME}?start=file_{unique_id}"
 
     logger.info(
@@ -417,7 +453,7 @@ def file_redirect(unique_id: str) -> Response:
         unique_id, ip, BOT_USERNAME,
     )
 
-    # 3. Track click in MongoDB (non-blocking — errors are logged, not raised)
+    # Track click (non-blocking)
     try:
         track_click(unique_id, ip=ip, user_agent=user_agent)
     except Exception as exc:
@@ -425,7 +461,6 @@ def file_redirect(unique_id: str) -> Response:
 
     logger.info("[REDIRECT] Redirecting -> %s", tg_link)
 
-    # 4. Return countdown/delay HTML page
     html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -436,55 +471,24 @@ def file_redirect(unique_id: str) -> Response:
     * {{ margin: 0; padding: 0; box-sizing: border-box; }}
     body {{
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      background: #0f0f1a;
-      color: #e0e0e0;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      min-height: 100vh;
+      background: #0f0f1a; color: #e0e0e0;
+      display: flex; align-items: center;
+      justify-content: center; min-height: 100vh;
     }}
     .card {{
-      text-align: center;
-      padding: 40px 32px;
-      background: #1a1a2e;
-      border-radius: 16px;
-      max-width: 360px;
-      width: 90%;
+      text-align: center; padding: 40px 32px;
+      background: #1a1a2e; border-radius: 16px;
+      max-width: 360px; width: 90%;
       box-shadow: 0 8px 32px rgba(0,0,0,0.4);
     }}
     .icon {{ font-size: 48px; margin-bottom: 16px; }}
     h2 {{ font-size: 20px; margin-bottom: 8px; color: #ffffff; }}
     p  {{ font-size: 14px; color: #888; margin-bottom: 24px; }}
-    .counter {{
-      font-size: 40px;
-      font-weight: 700;
-      color: #5b8dee;
-      margin-bottom: 20px;
-    }}
-    .bar-wrap {{
-      background: #2a2a3e;
-      border-radius: 8px;
-      overflow: hidden;
-      height: 6px;
-      margin-bottom: 24px;
-    }}
-    .bar {{
-      height: 100%;
-      background: linear-gradient(90deg, #5b8dee, #a855f7);
-      width: 100%;
-      animation: shrink 5s linear forwards;
-    }}
+    .counter {{ font-size: 40px; font-weight: 700; color: #5b8dee; margin-bottom: 20px; }}
+    .bar-wrap {{ background: #2a2a3e; border-radius: 8px; overflow: hidden; height: 6px; margin-bottom: 24px; }}
+    .bar {{ height: 100%; background: linear-gradient(90deg, #5b8dee, #a855f7); width: 100%; animation: shrink 5s linear forwards; }}
     @keyframes shrink {{ from {{ width: 100%; }} to {{ width: 0%; }} }}
-    a.btn {{
-      display: inline-block;
-      padding: 12px 28px;
-      background: #5b8dee;
-      color: #fff;
-      border-radius: 8px;
-      text-decoration: none;
-      font-size: 15px;
-      font-weight: 600;
-    }}
+    a.btn {{ display: inline-block; padding: 12px 28px; background: #5b8dee; color: #fff; border-radius: 8px; text-decoration: none; font-size: 15px; font-weight: 600; }}
   </style>
 </head>
 <body>
@@ -498,14 +502,11 @@ def file_redirect(unique_id: str) -> Response:
   </div>
   <script>
     var count = 5;
-    var el    = document.getElementById("count");
-    var iv    = setInterval(function() {{
+    var el = document.getElementById("count");
+    var iv = setInterval(function() {{
       count--;
       el.textContent = count;
-      if (count <= 0) {{
-        clearInterval(iv);
-        window.location.href = "{tg_link}";
-      }}
+      if (count <= 0) {{ clearInterval(iv); window.location.href = "{tg_link}"; }}
     }}, 1000);
   </script>
 </body>
