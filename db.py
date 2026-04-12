@@ -263,3 +263,51 @@ def track_click(unique_id: str, ip: str, user_agent: str) -> None:
         "[CLICK] Tracked click | unique_id=%s | ip=%s",
         unique_id, ip,
     )
+
+# ─── Verified Users API ───────────────────────────────────────────────────────
+
+def verify_user(user_id: int) -> None:
+    """
+    Mark a user as verified right now.
+    Upserts into `verified_users` collection with verified_at = now.
+    """
+    if _db is None:
+        raise RuntimeError("Database not initialised — call init_db() first.")
+
+    now = datetime.now(tz=timezone.utc)
+    _db["verified_users"].update_one(
+        {"user_id": user_id},
+        {"$set": {"user_id": user_id, "verified_at": now}},
+        upsert=True,
+    )
+    logger.info("[VERIFY] User verified | user_id=%s | verified_at=%s", user_id, now.isoformat())
+
+
+def is_user_verified(user_id: int) -> bool:
+    """
+    Return True if user verified within the last 24 hours.
+    """
+    if _db is None:
+        raise RuntimeError("Database not initialised — call init_db() first.")
+
+    doc = _db["verified_users"].find_one({"user_id": user_id})
+    if not doc:
+        return False
+
+    verified_at = doc.get("verified_at")
+    if not verified_at:
+        return False
+
+    # Make tz-aware if MongoDB returned naive datetime
+    if verified_at.tzinfo is None:
+        verified_at = verified_at.replace(tzinfo=timezone.utc)
+
+    now     = datetime.now(tz=timezone.utc)
+    elapsed = (now - verified_at).total_seconds()
+    valid   = elapsed < 86400  # 24 hours
+
+    logger.info(
+        "[VERIFY] is_user_verified user_id=%s → %s | elapsed=%.0fs",
+        user_id, valid, elapsed,
+    )
+    return valid
