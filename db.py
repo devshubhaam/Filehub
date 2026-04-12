@@ -234,3 +234,32 @@ def _smoke_test() -> None:
     doc = col.find_one({"_id": result.inserted_id})
     logger.info("MongoDB smoke-test document -> %s", doc)
     print(f"\n[DB SMOKE TEST] Inserted document: {doc}\n")
+
+def track_click(unique_id: str, ip: str, user_agent: str) -> None:
+    """
+    Record a click event in the `clicks` collection.
+
+    Schema:
+      unique_id  — which file was accessed
+      ip         — visitor IP address
+      user_agent — visitor browser/client string
+      timestamp  — UTC datetime of the click
+    """
+    if _db is None:
+        raise RuntimeError("Database not initialised — call init_db() first.")
+
+    clicks_col = _db["clicks"]
+    now        = datetime.now(tz=timezone.utc)
+
+    clicks_col.insert_one(
+        {
+            "unique_id":  unique_id,
+            "ip":         ip,
+            "user_agent": user_agent,
+            "timestamp":  now,
+        }
+    )
+    logger.info(
+        "[CLICK] Tracked click | unique_id=%s | ip=%s",
+        unique_id, ip,
+    )
