@@ -38,10 +38,8 @@ from db import (
     remove_file_id,
     increment_views,
     upsert_user,
-    verify_user,
-    is_user_verified,
 )
-from helpers import extract_unique_id, generate_link, generate_shortlink
+from helpers import extract_unique_id, generate_link
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -71,9 +69,6 @@ ADMIN_IDS: set[int] = {
     for uid in os.environ.get("ADMIN_IDS", "").split(",")
     if uid.strip().isdigit()
 }
-
-DOMAIN           = os.environ.get("DOMAIN", WEBHOOK_URL).rstrip("/")
-SHORTLINK_API    = os.environ.get("SHORTLINK_API", "")
 
 WEBHOOK_PATH     = "/webhook"
 WEBHOOK_FULL_URL = f"{WEBHOOK_URL}{WEBHOOK_PATH}"
@@ -376,31 +371,8 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             status, user_id, unique_id,
         )
 
-        # 3. Verification check — must pass shortlink before accessing file
-        if not is_user_verified(user_id):
-            shortlink = generate_shortlink(unique_id)
-            logger.info(
-                "[VERIFY] User not verified | user_id=%s | unique_id=%s | link=%s",
-                user_id, unique_id, shortlink,
-            )
-            from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-            keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔗 Click Here to Verify & Get File", url=shortlink)]
-            ])
-            await update.message.reply_text(
-                "🔐 *Verification Required*\n\n"
-                "━━━━━━━━━━━━━━━━━━━━\n"
-                "To access this file, you need to complete a quick verification.\n\n"
-                "👇 *Click the button below*, complete the process, "
-                "then return here to receive your file.\n\n"
-                "✅ Once verified, access is valid for *24 hours*.",
-                parse_mode="Markdown",
-                reply_markup=keyboard,
-            )
-            return
-
-        # 4. Verified — deliver file
-        logger.info("[DELIVERY] Verified user | unique_id=%s | user_id=%s", unique_id, user_id)
+        # 3. Deliver file
+        logger.info("[DELIVERY] Request: unique_id=%s | user_id=%s", unique_id, user_id)
         await send_file_with_fallback(update, context, unique_id)
         return
 
@@ -590,100 +562,6 @@ def file_redirect(unique_id: str) -> Response:
 
     return make_response(html, 200)
 
-
-
-@flask_app.get("/verify")
-def verify_route() -> Response:
-    """
-    Shortlink verification endpoint.
-
-    Flow:
-      GET /verify?uid=<unique_id>
-        1. Extract uid from query params
-        2. Try to get user_id from token param (set by shortlink provider callback)
-           — If not present, show a "tap to confirm" page that posts back with user_id
-        3. Mark user as verified in MongoDB (24h token)
-        4. Redirect to Telegram deep-link
-    """
-    from flask import make_response, redirect
-
-    uid        = request.args.get("uid", "")
-    user_agent = request.headers.get("User-Agent", "")
-
-    if not uid:
-        return make_response("Bad request — missing uid", 400)
-
-    # Anti-bot
-    if not user_agent:
-        return make_response("Access denied", 403)
-
-    tg_link = f"https://t.me/{BOT_USERNAME}?start=file_{uid}"
-
-    # The shortlink provider redirects here after the user views the ad.
-    # We use IP as anonymous identifier (same as /file route) since we have
-    # no Telegram user_id at this point — the user will get the file when
-    # they return to the bot via the tg_link redirect.
-    ip      = request.remote_addr
-    anon_id = abs(hash(ip + user_agent[:20])) % (10 ** 9)
-
-    verify_user(anon_id)
-    logger.info(
-        "[VERIFY] Verification complete | anon_id=%s | uid=%s | ip=%s",
-        anon_id, uid, ip,
-    )
-
-    # Show a clean success page that auto-redirects to Telegram
-    html = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Verified!</title>
-  <style>
-    *{{margin:0;padding:0;box-sizing:border-box}}
-    body{{
-      font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
-      background:#0f0f1a;color:#e0e0e0;
-      display:flex;align-items:center;justify-content:center;min-height:100vh;
-    }}
-    .card{{
-      text-align:center;padding:40px 32px;background:#1a1a2e;
-      border-radius:16px;max-width:360px;width:90%;
-      box-shadow:0 8px 32px rgba(0,0,0,0.4);
-    }}
-    .icon{{font-size:56px;margin-bottom:16px}}
-    h2{{font-size:22px;font-weight:700;color:#fff;margin-bottom:10px}}
-    p{{font-size:14px;color:#888;margin-bottom:28px;line-height:1.6}}
-    .badge{{
-      display:inline-block;background:#1e3a5f;color:#5b8dee;
-      padding:6px 16px;border-radius:20px;font-size:13px;
-      font-weight:600;margin-bottom:24px;
-    }}
-    .btn{{
-      display:inline-block;padding:14px 32px;
-      background:linear-gradient(135deg,#5b8dee,#a855f7);
-      color:#fff;border-radius:10px;text-decoration:none;
-      font-size:15px;font-weight:700;
-    }}
-    .note{{font-size:11px;color:#555;margin-top:16px}}
-  </style>
-</head>
-<body>
-<div class="card">
-  <div class="icon">✅</div>
-  <h2>Verification Complete!</h2>
-  <div class="badge">24 Hour Access Granted</div>
-  <p>You are now verified. Return to the bot to receive your file.</p>
-  <a class="btn" href="{tg_link}">📂 Open in Telegram</a>
-  <div class="note">You will not need to verify again for 24 hours.</div>
-</div>
-<script>
-  setTimeout(function() {{ window.location.href = "{tg_link}"; }}, 3000);
-</script>
-</body>
-</html>"""
-
-    return make_response(html, 200)
 
 
 # ─── Startup ──────────────────────────────────────────────────────────────────
