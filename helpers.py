@@ -4,7 +4,7 @@ helpers.py — Utility functions for the Telegram File Sharing Bot.
 Provides:
   - extract_unique_id(caption) → str
   - generate_link(unique_id)   → str
-  - generate_shortlink(unique_id) → str
+  - shorten_url(url)           → str   ← NEW: GPlink / VPlink / LinkPays / generic
 """
 
 import logging
@@ -13,6 +13,8 @@ import random
 import re
 import string
 
+import requests as http_requests
+
 logger = logging.getLogger(__name__)
 
 # ─── Constants ────────────────────────────────────────────────────────────────
@@ -20,6 +22,21 @@ logger = logging.getLogger(__name__)
 _ID_PATTERN = re.compile(r"ID:\s*([a-zA-Z0-9_-]+)", re.IGNORECASE)
 _ID_CHARS   = string.ascii_lowercase + string.digits
 _ID_LENGTH  = 9
+
+# ─── Supported Shortener Providers ───────────────────────────────────────────
+#
+#  Set in .env:
+#    SHORTENER_API_URL  = https://gplinks.in/api      (or vplink / linkpays etc.)
+#    SHORTENER_API_KEY  = your_api_key_here
+#    SHORTENER_PROVIDER = gplinks   (gplinks | vplink | linkpays | generic)
+#
+# Provider-specific response key mapping:
+_PROVIDER_KEYS = {
+    "gplinks":  ["shortenedUrl", "short_url", "shortlink"],
+    "vplink":   ["shortenedUrl", "short_url", "shortlink"],
+    "linkpays": ["short_url", "shortenedUrl", "shortlink"],
+    "generic":  ["shortenedUrl", "short_url", "shortlink", "url"],
+}
 
 
 # ─── Public API ───────────────────────────────────────────────────────────────
@@ -54,6 +71,25 @@ def generate_link(unique_id: str, bot_username: str) -> str:
     return link
 
 
+def shorten_url(target_url: str) -> str:
+    """
+    Shorten a URL using the configured link shortener.
+
+    Reads from environment:
+      SHORTENER_API_URL  — provider API endpoint
+      SHORTENER_API_KEY  — your API key
+      SHORTENER_PROVIDER — provider name (gplinks | vplink | linkpays | generic)
+
+    Returns shortened URL on success, original URL as fallback.
+    """
+    api_url  = os.environ.get("SHORTENER_API_URL", "").strip()
+    api_key  = os.environ.get("SHORTENER_API_KEY", "").strip()
+    provider = os.environ.get("SHORTENER_PROVIDER", "generic").strip().lower()
+
+    if not api_url or not api_key:
+        logger.warning("[SHORTENER] Not configured — SHORTENER_API_URL or SHORTENER_API_KEY missing")
+        return target_url
+
     try:
         resp = http_requests.get(
             api_url,
@@ -63,25 +99,27 @@ def generate_link(unique_id: str, bot_username: str) -> str:
         resp.raise_for_status()
         data = resp.json()
 
-        # GPLinks / most providers return shortenedUrl or short_url
-        short = (
-            data.get("shortenedUrl")
-            or data.get("short_url")
-            or data.get("shortlink")
-            or data.get("result", {}).get("url")
-        )
+        keys_to_try = _PROVIDER_KEYS.get(provider, _PROVIDER_KEYS["generic"])
+        for key in keys_to_try:
+            short = data.get(key)
+            if short:
+                logger.info("[SHORTENER][%s] %s -> %s", provider, target_url, short)
+                return short
 
-        if short:
-            logger.info("[SHORTLINK] Generated: %s → %s", target_url, short)
-            return short
+        nested = data.get("result") or data.get("data") or {}
+        if isinstance(nested, dict):
+            for key in keys_to_try:
+                short = nested.get(key)
+                if short:
+                    logger.info("[SHORTENER][%s] (nested) %s -> %s", provider, target_url, short)
+                    return short
 
-        logger.warning("[SHORTLINK] Unexpected API response: %s", data)
+        logger.warning("[SHORTENER][%s] Unexpected API response: %s", provider, data)
 
     except Exception as exc:
-        logger.error("[SHORTLINK] API call failed: %s — using fallback", exc)
+        logger.error("[SHORTENER] API call failed: %s — using fallback URL", exc)
 
-    # Fallback: return raw verify URL
-    logger.info("[SHORTLINK] Falling back to direct URL: %s", target_url)
+    logger.info("[SHORTENER] Falling back to direct URL: %s", target_url)
     return target_url
 
 
