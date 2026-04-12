@@ -13,11 +13,6 @@ import random
 import re
 import string
 
-import requests as http_requests
-from dotenv import load_dotenv
-
-load_dotenv()
-
 logger = logging.getLogger(__name__)
 
 # ─── Constants ────────────────────────────────────────────────────────────────
@@ -58,29 +53,6 @@ def generate_link(unique_id: str, bot_username: str) -> str:
     logger.info("Generated permanent link: %s", link)
     return link
 
-
-def generate_shortlink(unique_id: str) -> str:
-    """
-    Create a monetized shortlink for the verification page.
-
-    Flow:
-      1. Build target URL: DOMAIN/verify?uid=<unique_id>
-      2. Call SHORTLINK_URL API with SHORTLINK_API key
-      3. Return shortened URL on success
-      4. Return raw target URL as fallback on any failure
-
-    Expected API response format (GPLinks / standard):
-      { "status": "success", "shortenedUrl": "https://..." }
-    """
-    domain        = os.environ.get("DOMAIN", "").rstrip("/")
-    api_url       = os.environ.get("SHORTLINK_URL", "")
-    api_key       = os.environ.get("SHORTLINK_API", "")
-    target_url    = f"{domain}/verify?uid={unique_id}"
-
-    # Fallback if env vars not configured
-    if not api_url or not api_key:
-        logger.warning("[SHORTLINK] API not configured — using direct URL as fallback")
-        return target_url
 
     try:
         resp = http_requests.get(
