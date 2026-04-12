@@ -4,20 +4,27 @@ helpers.py — Utility functions for the Telegram File Sharing Bot.
 Provides:
   - extract_unique_id(caption) → str
   - generate_link(unique_id)   → str
+  - generate_shortlink(unique_id) → str
 """
 
 import logging
+import os
 import random
 import re
 import string
+
+import requests as http_requests
+from dotenv import load_dotenv
+
+load_dotenv()
 
 logger = logging.getLogger(__name__)
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
 _ID_PATTERN = re.compile(r"ID:\s*([a-zA-Z0-9_-]+)", re.IGNORECASE)
-_ID_CHARS   = string.ascii_lowercase + string.digits   # a-z + 0-9
-_ID_LENGTH  = 9                                        # 8–10 chars
+_ID_CHARS   = string.ascii_lowercase + string.digits
+_ID_LENGTH  = 9
 
 
 # ─── Public API ───────────────────────────────────────────────────────────────
@@ -27,14 +34,8 @@ def extract_unique_id(caption: str | None) -> str:
     Extract unique_id from a file caption.
 
     Rules:
-      - If caption contains "ID: <value>"  → return <value>
-      - Otherwise                          → return random 9-char alphanumeric ID
-
-    Examples:
-      "ID: test123"    → "test123"
-      "ID:abc"         → "abc"
-      "some text"      → "k9mxqr4a2"  (random)
-      None             → "k9mxqr4a2"  (random)
+      - "ID: <value>" found → return <value>
+      - Not found           → return random 9-char alphanumeric ID
     """
     if caption:
         match = _ID_PATTERN.search(caption)
@@ -50,17 +51,66 @@ def extract_unique_id(caption: str | None) -> str:
 
 def generate_link(unique_id: str, bot_username: str) -> str:
     """
-    Generate a permanent deep-link for a file.
-
+    Generate a permanent Telegram deep-link for a file.
     Format: https://t.me/<bot_username>?start=file_<unique_id>
-
-    Example:
-      generate_link("test123", "hubfilerobot")
-      → "https://t.me/hubfilerobot?start=file_test123"
     """
     link = f"https://t.me/{bot_username}?start=file_{unique_id}"
     logger.info("Generated permanent link: %s", link)
     return link
+
+
+def generate_shortlink(unique_id: str) -> str:
+    """
+    Create a monetized shortlink for the verification page.
+
+    Flow:
+      1. Build target URL: DOMAIN/verify?uid=<unique_id>
+      2. Call SHORTLINK_URL API with SHORTLINK_API key
+      3. Return shortened URL on success
+      4. Return raw target URL as fallback on any failure
+
+    Expected API response format (GPLinks / standard):
+      { "status": "success", "shortenedUrl": "https://..." }
+    """
+    domain        = os.environ.get("DOMAIN", "").rstrip("/")
+    api_url       = os.environ.get("SHORTLINK_URL", "")
+    api_key       = os.environ.get("SHORTLINK_API", "")
+    target_url    = f"{domain}/verify?uid={unique_id}"
+
+    # Fallback if env vars not configured
+    if not api_url or not api_key:
+        logger.warning("[SHORTLINK] API not configured — using direct URL as fallback")
+        return target_url
+
+    try:
+        resp = http_requests.get(
+            api_url,
+            params={"api": api_key, "url": target_url},
+            timeout=8,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        # GPLinks / most providers return shortenedUrl or short_url
+        short = (
+            data.get("shortenedUrl")
+            or data.get("short_url")
+            or data.get("shortlink")
+            or data.get("result", {}).get("url")
+        )
+
+        if short:
+            logger.info("[SHORTLINK] Generated: %s → %s", target_url, short)
+            return short
+
+        logger.warning("[SHORTLINK] Unexpected API response: %s", data)
+
+    except Exception as exc:
+        logger.error("[SHORTLINK] API call failed: %s — using fallback", exc)
+
+    # Fallback: return raw verify URL
+    logger.info("[SHORTLINK] Falling back to direct URL: %s", target_url)
+    return target_url
 
 
 # ─── Internal helpers ─────────────────────────────────────────────────────────
@@ -68,4 +118,3 @@ def generate_link(unique_id: str, bot_username: str) -> str:
 def _random_id() -> str:
     """Return a random lowercase alphanumeric string of length _ID_LENGTH."""
     return "".join(random.choices(_ID_CHARS, k=_ID_LENGTH))
-
