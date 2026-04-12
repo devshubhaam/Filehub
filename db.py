@@ -263,3 +263,75 @@ def track_click(unique_id: str, ip: str, user_agent: str) -> None:
         "[CLICK] Tracked click | unique_id=%s | ip=%s",
         unique_id, ip,
     )
+
+
+# ─── Token Verification API ───────────────────────────────────────────────────
+
+def save_token(unique_id: str, token: str, ttl_seconds: int = 600) -> None:
+    """
+    Store a verification token for a file request.
+
+    Schema:
+      unique_id  — which file this token is for
+      token      — random secret token
+      used       — False until redeemed
+      expires_at — UTC datetime (default: 10 minutes from now)
+      created_at — UTC datetime
+    """
+    if _db is None:
+        raise RuntimeError("Database not initialised — call init_db() first.")
+
+    from datetime import timedelta
+
+    tokens_col = _db["tokens"]
+    now        = datetime.now(tz=timezone.utc)
+
+    # Create TTL index if not exists (MongoDB auto-deletes expired docs)
+    tokens_col.create_index("expires_at", expireAfterSeconds=0)
+
+    tokens_col.insert_one({
+        "unique_id":  unique_id,
+        "token":      token,
+        "used":       False,
+        "expires_at": now + timedelta(seconds=ttl_seconds),
+        "created_at": now,
+    })
+    logger.info("[TOKEN] Saved token for unique_id=%s | expires in %ds", unique_id, ttl_seconds)
+
+
+def verify_and_consume_token(unique_id: str, token: str) -> bool:
+    """
+    Verify a token for a given unique_id.
+
+    Returns True if:
+      - Token exists in DB
+      - Token matches the given unique_id
+      - Token is not already used
+      - Token has not expired
+
+    On success, marks the token as used=True (one-time use).
+    """
+    if _db is None:
+        raise RuntimeError("Database not initialised — call init_db() first.")
+
+    tokens_col = _db["tokens"]
+    now        = datetime.now(tz=timezone.utc)
+
+    doc = tokens_col.find_one({
+        "unique_id":  unique_id,
+        "token":      token,
+        "used":       False,
+        "expires_at": {"$gt": now},
+    })
+
+    if not doc:
+        logger.warning("[TOKEN] Invalid/expired token for unique_id=%s | token=%s", unique_id, token[:8])
+        return False
+
+    # Mark as used (one-time redemption)
+    tokens_col.update_one(
+        {"_id": doc["_id"]},
+        {"$set": {"used": True, "used_at": now}},
+    )
+    logger.info("[TOKEN] Token verified and consumed for unique_id=%s", unique_id)
+    return True
