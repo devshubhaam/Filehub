@@ -247,7 +247,7 @@ async def send_file_with_fallback(
     sent = False
     for index, file_id in enumerate(file_ids):
         try:
-            await context.bot.send_document(
+            sent_msg = await context.bot.send_document(
                 chat_id=chat_id,
                 document=file_id,
             )
@@ -261,6 +261,54 @@ async def send_file_with_fallback(
 
             # Increment analytics counter
             increment_views(unique_id)
+
+            # Send auto-delete notice
+            notice_msg = await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "⏳ *Auto-Delete Notice*\n\n"
+                    "This file will be automatically deleted from this chat "
+                    "in *10 minutes* for security purposes.\n\n"
+                    "_Save it before the timer runs out!_"
+                ),
+                parse_mode="Markdown",
+            )
+
+            # Schedule deletion of both file + notice after 600 seconds
+            DELETE_AFTER = 600
+            async def _delete_messages(
+                bot,
+                cid: int,
+                file_message_id: int,
+                notice_message_id: int,
+            ) -> None:
+                await asyncio.sleep(DELETE_AFTER)
+                for mid in (file_message_id, notice_message_id):
+                    try:
+                        await bot.delete_message(chat_id=cid, message_id=mid)
+                        logger.info(
+                            "[AUTO-DELETE] Deleted message_id=%s | chat_id=%s",
+                            mid, cid,
+                        )
+                    except Exception as del_exc:
+                        logger.warning(
+                            "[AUTO-DELETE] Could not delete message_id=%s: %s",
+                            mid, del_exc,
+                        )
+
+            asyncio.ensure_future(
+                _delete_messages(
+                    context.bot,
+                    chat_id,
+                    sent_msg.message_id,
+                    notice_msg.message_id,
+                ),
+                loop=_event_loop,
+            )
+            logger.info(
+                "[AUTO-DELETE] Scheduled deletion in %ds | chat_id=%s",
+                DELETE_AFTER, chat_id,
+            )
 
             sent = True
             break
