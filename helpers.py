@@ -128,3 +128,4 @@ def shorten_url(target_url: str) -> str:
 def _random_id() -> str:
     """Return a random lowercase alphanumeric string of length _ID_LENGTH."""
     return "".join(random.choices(_ID_CHARS, k=_ID_LENGTH))
+
