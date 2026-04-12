@@ -26,6 +26,7 @@ from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     ContextTypes,
+    CallbackQueryHandler,
     MessageHandler,
     filters,
 )
@@ -40,6 +41,11 @@ from db import (
     upsert_user,
     verify_user,
     can_access,
+    submit_payment,
+    approve_payment,
+    reject_payment,
+    reject_all_pending,
+    is_premium,
 )
 from helpers import extract_unique_id, generate_link, generate_shortlink
 from dotenv import load_dotenv
@@ -389,31 +395,35 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         # 2. Track user activity
         upsert_user(user_id, first_name=user.first_name or "")
 
-        # 3. Access control — must be verified within last 24 hours
-        if not can_access(user_id):
-            logger.info("[ACCESS] Blocked — not verified | user_id=%s | unique_id=%s", user_id, unique_id)
-
-            # Build verify deep-link and wrap it in Linkshortify shortlink
-            verify_url  = f"https://t.me/{BOT_USERNAME}?start=verify_access_{unique_id}"
-            short_url   = generate_shortlink(verify_url)
-
-            logger.info("[ACCESS] Shortlink generated | user_id=%s | short=%s", user_id, short_url)
-
-            keyboard = InlineKeyboardMarkup([[
-                InlineKeyboardButton("✅ Verify Now", url=short_url)
-            ]])
-            await update.message.reply_text(
-                "🔐 *Access Required*\n\n"
-                "*Verify once to unlock all files for 24 hours.*\n\n"
-                "_Click the button below to complete verification._",
-                parse_mode="Markdown",
-                reply_markup=keyboard,
-            )
+        # 3. Priority 1 — Premium user → direct access
+        if is_premium(user_id):
+            logger.info("[ACCESS] Premium granted | user_id=%s | unique_id=%s", user_id, unique_id)
+            await send_file_with_fallback(update, context, unique_id)
             return
 
-        # 4. Verified — deliver file directly
-        logger.info("[ACCESS] Granted | user_id=%s | unique_id=%s", user_id, unique_id)
-        await send_file_with_fallback(update, context, unique_id)
+        # 4. Priority 2 — Shortlink-verified (24h token) → direct access
+        if can_access(user_id):
+            logger.info("[ACCESS] Verified (24h) granted | user_id=%s | unique_id=%s", user_id, unique_id)
+            await send_file_with_fallback(update, context, unique_id)
+            return
+
+        # 5. Priority 3 — Not verified → send shortlink button
+        logger.info("[ACCESS] Blocked | user_id=%s | unique_id=%s", user_id, unique_id)
+
+        verify_url = f"https://t.me/{BOT_USERNAME}?start=verify_access_{unique_id}"
+        short_url  = generate_shortlink(verify_url)
+        logger.info("[ACCESS] Shortlink generated | user_id=%s | short=%s", user_id, short_url)
+
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Verify Now", url=short_url)
+        ]])
+        await update.message.reply_text(
+            "🔐 *Access Required*\n\n"
+            "*Verify once to unlock all files for 24 hours.*\n\n"
+            "_Click the button below to complete verification._",
+            parse_mode="Markdown",
+            reply_markup=keyboard,
+        )
         return
 
     # ── Plain /start ──────────────────────────────────────────────────────────
@@ -478,6 +488,173 @@ async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYP
                 file_type, post.chat.id, caption)
     await _handle_file_upload(update, context, file_id, caption, source="channel")
 
+
+
+# ─── Payment Handlers ─────────────────────────────────────────────────────────
+
+async def paid_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /paid <UTR>
+    User submits a payment UTR for admin review.
+    """
+    user    = update.effective_user
+    user_id = user.id
+
+    if not context.args:
+        await update.message.reply_text(
+            "⚠️ *Usage:* `/paid <UTR number>`\n\n"
+            "_Example: /paid 123456789012_",
+            parse_mode="Markdown",
+        )
+        return
+
+    utr    = context.args[0].strip()
+    result = submit_payment(user_id, utr)
+
+    if result == "duplicate":
+        await update.message.reply_text(
+            "⚠️ *Duplicate UTR*\n\n"
+            "*This UTR has already been submitted.*\n\n"
+            "_Please check and try again._",
+            parse_mode="Markdown",
+        )
+        return
+
+    # Acknowledge user
+    await update.message.reply_text(
+        "✅ *Payment Submitted!*\n\n"
+        f"*UTR:* `{utr}`\n\n"
+        "_Your payment is under review. You will be notified once approved._",
+        parse_mode="Markdown",
+    )
+    logger.info("[PAYMENT] Submitted | user_id=%s | utr=%s", user_id, utr)
+
+    # Notify all admins with inline buttons
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Approve", callback_data=f"approve_{user_id}_{utr}"),
+            InlineKeyboardButton("❌ Reject",  callback_data=f"reject_{user_id}_{utr}"),
+        ],
+        [
+            InlineKeyboardButton("🚫 Reject All Pending", callback_data="reject_all"),
+        ],
+    ])
+
+    admin_msg = (
+        f"💰 *New Payment Request*\n\n"
+        f"👤 *User ID:* `{user_id}`\n"
+        f"🏷 *Name:* {user.first_name or 'Unknown'}\n"
+        f"🔢 *UTR:* `{utr}`\n"
+        f"📌 *Status:* PENDING"
+    )
+
+    for admin_id in ADMIN_IDS:
+        try:
+            await context.bot.send_message(
+                chat_id=admin_id,
+                text=admin_msg,
+                parse_mode="Markdown",
+                reply_markup=keyboard,
+            )
+        except Exception as exc:
+            logger.error("[PAYMENT] Failed to notify admin_id=%s: %s", admin_id, exc)
+
+
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Handle inline button callbacks for payment approval system.
+    Only ADMIN_IDS can trigger these actions.
+    """
+    query   = update.callback_query
+    admin   = query.from_user
+
+    # Security — only admins
+    if admin.id not in ADMIN_IDS:
+        await query.answer("🚫 You are not authorized.", show_alert=True)
+        logger.warning("[SECURITY] Unauthorized callback from user_id=%s", admin.id)
+        return
+
+    await query.answer()  # dismiss loading spinner
+    data = query.data
+
+    # ── Approve ───────────────────────────────────────────────────────────────
+    if data.startswith("approve_"):
+        parts   = data.split("_", 2)      # ["approve", user_id, utr]
+        user_id = int(parts[1])
+        utr     = parts[2]
+
+        approve_payment(user_id, utr)
+        logger.info("[PAYMENT] Approved by admin=%s | user_id=%s | utr=%s",
+                    admin.id, user_id, utr)
+
+        # Notify user
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=(
+                    "🎉 *Payment Approved!*\n\n"
+                    "*Your Premium access has been activated.*\n\n"
+                    "⏳ *Valid for 30 days.*\n\n"
+                    "_You now have unlimited access to all files._"
+                ),
+                parse_mode="Markdown",
+            )
+        except Exception as exc:
+            logger.warning("[PAYMENT] Could not notify user_id=%s: %s", user_id, exc)
+
+        # Update admin message
+        await query.edit_message_text(
+            f"✅ *Payment Approved*\n\n"
+            f"👤 User ID: `{user_id}`\n"
+            f"🔢 UTR: `{utr}`\n"
+            f"👮 Approved by: {admin.first_name}",
+            parse_mode="Markdown",
+        )
+
+    # ── Reject ────────────────────────────────────────────────────────────────
+    elif data.startswith("reject_") and data != "reject_all":
+        parts   = data.split("_", 2)      # ["reject", user_id, utr]
+        user_id = int(parts[1])
+        utr     = parts[2]
+
+        reject_payment(user_id, utr)
+        logger.info("[PAYMENT] Rejected by admin=%s | user_id=%s | utr=%s",
+                    admin.id, user_id, utr)
+
+        # Notify user
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=(
+                    "❌ *Payment Rejected*\n\n"
+                    f"*UTR:* `{utr}`\n\n"
+                    "_Your payment could not be verified. "
+                    "Please contact support if you believe this is an error._"
+                ),
+                parse_mode="Markdown",
+            )
+        except Exception as exc:
+            logger.warning("[PAYMENT] Could not notify user_id=%s: %s", user_id, exc)
+
+        await query.edit_message_text(
+            f"❌ *Payment Rejected*\n\n"
+            f"👤 User ID: `{user_id}`\n"
+            f"🔢 UTR: `{utr}`\n"
+            f"👮 Rejected by: {admin.first_name}",
+            parse_mode="Markdown",
+        )
+
+    # ── Reject All ────────────────────────────────────────────────────────────
+    elif data == "reject_all":
+        count = reject_all_pending()
+        logger.info("[PAYMENT] Reject-all by admin=%s | %d records", admin.id, count)
+
+        await query.edit_message_text(
+            f"🚫 *All Pending Payments Rejected*\n\n"
+            f"📊 *{count}* payment(s) have been rejected.\n\n"
+            f"👮 Action by: {admin.first_name}",
+            parse_mode="Markdown",
+        )
 
 # ─── Flask Routes ─────────────────────────────────────────────────────────────
 
@@ -606,6 +783,8 @@ def file_redirect(unique_id: str) -> Response:
 
 async def register_handlers() -> None:
     bot_app.add_handler(CommandHandler("start", start_handler))
+    bot_app.add_handler(CommandHandler("paid", paid_handler))
+    bot_app.add_handler(CallbackQueryHandler(callback_handler))
 
     file_filter = filters.Document.ALL | filters.VIDEO | filters.AUDIO
     bot_app.add_handler(MessageHandler(file_filter, upload_handler))
