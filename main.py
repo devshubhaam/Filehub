@@ -6,7 +6,10 @@ Entry point: initializes bot, Flask web server, and webhook.
 import asyncio
 import logging
 import os
+import threading
+import time
 
+import requests as http_requests
 from flask import Flask, Response, jsonify, request
 from telegram import Update
 from telegram.ext import Application, ApplicationBuilder, CommandHandler, ContextTypes
@@ -122,6 +125,18 @@ async def startup() -> None:
 
     logger.info("Bot is live and ready.")
 
+# ─── Keep-Alive (prevents Render free-tier sleep) ────────────────────────────
+
+def keep_alive() -> None:
+    """Ping own health-check endpoint every 10 min to prevent Render cold starts."""
+    while True:
+        time.sleep(600)  # 10 minutes
+        try:
+            resp = http_requests.get(f"{WEBHOOK_URL}/", timeout=10)
+            logger.info("Keep-alive ping → HTTP %s ✅", resp.status_code)
+        except Exception as exc:
+            logger.warning("Keep-alive ping failed: %s", exc)
+
 # ─── Entry Point ──────────────────────────────────────────────────────────────
 
 # We need a persistent event loop that both the startup coroutine and the
@@ -133,6 +148,10 @@ asyncio.set_event_loop(_event_loop)
 def main() -> None:
     # Run all async setup synchronously before Flask starts accepting requests.
     _event_loop.run_until_complete(startup())
+
+    # Start keep-alive background thread
+    threading.Thread(target=keep_alive, daemon=True).start()
+    logger.info("Keep-alive thread started ✅")
 
     # Start Flask in the foreground.
     # On Render / production set host="0.0.0.0" and use the $PORT env var.
