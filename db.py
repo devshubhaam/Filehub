@@ -333,3 +333,104 @@ def can_access(user_id: int) -> bool:
     Returns True only if user has a valid 24-hour verification token.
     """
     return is_user_verified(user_id)
+
+# ─── Payments API ─────────────────────────────────────────────────────────────
+
+def submit_payment(user_id: int, utr: str) -> str:
+    """
+    Store a new payment request.
+    Returns "ok" on success, "duplicate" if UTR already exists.
+    """
+    if _db is None:
+        raise RuntimeError("Database not initialised — call init_db() first.")
+
+    existing = _db["payments"].find_one({"utr": utr})
+    if existing:
+        logger.warning("[PAYMENT] Duplicate UTR=%s from user_id=%s", utr, user_id)
+        return "duplicate"
+
+    now = datetime.now(tz=timezone.utc)
+    _db["payments"].insert_one({
+        "user_id":   user_id,
+        "utr":       utr,
+        "status":    "pending",
+        "timestamp": now,
+    })
+    logger.info("[PAYMENT] Submitted | user_id=%s | utr=%s", user_id, utr)
+    return "ok"
+
+
+def approve_payment(user_id: int, utr: str) -> None:
+    """Mark payment approved and grant 30-day premium to user."""
+    if _db is None:
+        raise RuntimeError("Database not initialised — call init_db() first.")
+
+    from datetime import timedelta
+    now           = datetime.now(tz=timezone.utc)
+    valid_until   = now + timedelta(days=30)
+
+    _db["payments"].update_one(
+        {"user_id": user_id, "utr": utr},
+        {"$set": {"status": "approved", "approved_at": now}},
+    )
+    _db["premium_users"].update_one(
+        {"user_id": user_id},
+        {"$set": {"user_id": user_id, "valid_until": valid_until}},
+        upsert=True,
+    )
+    logger.info("[PAYMENT] Approved | user_id=%s | utr=%s | valid_until=%s",
+                user_id, utr, valid_until.isoformat())
+
+
+def reject_payment(user_id: int, utr: str) -> None:
+    """Mark a single payment as rejected."""
+    if _db is None:
+        raise RuntimeError("Database not initialised — call init_db() first.")
+
+    now = datetime.now(tz=timezone.utc)
+    _db["payments"].update_one(
+        {"user_id": user_id, "utr": utr},
+        {"$set": {"status": "rejected", "rejected_at": now}},
+    )
+    logger.info("[PAYMENT] Rejected | user_id=%s | utr=%s", user_id, utr)
+
+
+def reject_all_pending() -> int:
+    """
+    Reject all payments currently in pending status.
+    Returns count of documents updated.
+    """
+    if _db is None:
+        raise RuntimeError("Database not initialised — call init_db() first.")
+
+    now    = datetime.now(tz=timezone.utc)
+    result = _db["payments"].update_many(
+        {"status": "pending"},
+        {"$set": {"status": "rejected", "rejected_at": now}},
+    )
+    logger.info("[PAYMENT] Reject-all | %d records updated", result.modified_count)
+    return result.modified_count
+
+
+def is_premium(user_id: int) -> bool:
+    """Return True if user has active premium (valid_until > now)."""
+    if _db is None:
+        raise RuntimeError("Database not initialised — call init_db() first.")
+
+    doc = _db["premium_users"].find_one(
+        {"user_id": user_id},
+        {"valid_until": 1},
+    )
+    if not doc:
+        return False
+
+    valid_until = doc.get("valid_until")
+    if not valid_until:
+        return False
+
+    if valid_until.tzinfo is None:
+        valid_until = valid_until.replace(tzinfo=timezone.utc)
+
+    result = valid_until > datetime.now(tz=timezone.utc)
+    logger.info("[PREMIUM] is_premium user_id=%s → %s", user_id, result)
+    return result
