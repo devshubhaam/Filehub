@@ -20,7 +20,7 @@ from collections import defaultdict
 
 import requests as http_requests
 from flask import Flask, Response, jsonify, request
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -38,8 +38,10 @@ from db import (
     remove_file_id,
     increment_views,
     upsert_user,
+    verify_user,
+    can_access,
 )
-from helpers import extract_unique_id, generate_link
+from helpers import extract_unique_id, generate_link, generate_shortlink
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -69,6 +71,8 @@ ADMIN_IDS: set[int] = {
     for uid in os.environ.get("ADMIN_IDS", "").split(",")
     if uid.strip().isdigit()
 }
+
+SHORTLINK_API    = os.environ.get("SHORTLINK_API", "")
 
 WEBHOOK_PATH     = "/webhook"
 WEBHOOK_FULL_URL = f"{WEBHOOK_URL}{WEBHOOK_PATH}"
@@ -348,7 +352,27 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     user_id = user.id
     args    = context.args
 
-    # ── File deep-link ────────────────────────────────────────────────────────
+    # ── Verification flow: /start verify_access_<unique_id> ─────────────────
+    if args and args[0].startswith("verify_access_"):
+        unique_id = args[0][len("verify_access_"):]
+
+        verify_user(user_id)
+        upsert_user(user_id, first_name=user.first_name or "")
+        logger.info("[ACCESS] Verification complete | user_id=%s", user_id)
+
+        await update.message.reply_text(
+            "✅ *Verification Successful!*\n\n"
+            "*You now have 24-hour access to ALL files.*\n\n"
+            "_Sending your file now..._",
+            parse_mode="Markdown",
+        )
+
+        # Immediately deliver the file they originally requested
+        logger.info("[DELIVERY] Post-verify delivery | unique_id=%s | user_id=%s", unique_id, user_id)
+        await send_file_with_fallback(update, context, unique_id)
+        return
+
+    # ── File deep-link: /start file_<unique_id> ───────────────────────────────
     if args and args[0].startswith("file_"):
         unique_id = args[0][len("file_"):]
 
@@ -363,14 +387,32 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             return
 
         # 2. Track user activity
-        status = upsert_user(user_id, first_name=user.first_name or "")
-        logger.info(
-            "[USER] %s user | user_id=%s | unique_id=%s",
-            status, user_id, unique_id,
-        )
+        upsert_user(user_id, first_name=user.first_name or "")
 
-        # 3. Deliver file
-        logger.info("[DELIVERY] Request: unique_id=%s | user_id=%s", unique_id, user_id)
+        # 3. Access control — must be verified within last 24 hours
+        if not can_access(user_id):
+            logger.info("[ACCESS] Blocked — not verified | user_id=%s | unique_id=%s", user_id, unique_id)
+
+            # Build verify deep-link and wrap it in Linkshortify shortlink
+            verify_url  = f"https://t.me/{BOT_USERNAME}?start=verify_access_{unique_id}"
+            short_url   = generate_shortlink(verify_url)
+
+            logger.info("[ACCESS] Shortlink generated | user_id=%s | short=%s", user_id, short_url)
+
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Verify Now", url=short_url)
+            ]])
+            await update.message.reply_text(
+                "🔐 *Access Required*\n\n"
+                "*Verify once to unlock all files for 24 hours.*\n\n"
+                "_Click the button below to complete verification._",
+                parse_mode="Markdown",
+                reply_markup=keyboard,
+            )
+            return
+
+        # 4. Verified — deliver file directly
+        logger.info("[ACCESS] Granted | user_id=%s | unique_id=%s", user_id, unique_id)
         await send_file_with_fallback(update, context, unique_id)
         return
 
