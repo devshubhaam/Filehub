@@ -263,3 +263,73 @@ def track_click(unique_id: str, ip: str, user_agent: str) -> None:
         "[CLICK] Tracked click | unique_id=%s | ip=%s",
         unique_id, ip,
     )
+
+# ─── Verified Users API ───────────────────────────────────────────────────────
+
+_ACCESS_HOURS = 24  # hours before re-verification required
+
+
+def verify_user(user_id: int) -> None:
+    """
+    Store or update verification time for user_id.
+
+    - If user exists → update verified_at to now
+    - If not         → insert new record
+
+    Single upsert query — optimised for high traffic.
+    """
+    if _db is None:
+        raise RuntimeError("Database not initialised — call init_db() first.")
+
+    now = datetime.now(tz=timezone.utc)
+    _db["verified_users"].update_one(
+        {"user_id": user_id},
+        {"$set": {"user_id": user_id, "verified_at": now}},
+        upsert=True,
+    )
+    logger.info("[ACCESS] User verified | user_id=%s | verified_at=%s", user_id, now.isoformat())
+
+
+def is_user_verified(user_id: int) -> bool:
+    """
+    Return True if user verified within the last 24 hours.
+
+    Single DB query. Handles naive/aware datetime from MongoDB safely.
+    """
+    if _db is None:
+        raise RuntimeError("Database not initialised — call init_db() first.")
+
+    doc = _db["verified_users"].find_one(
+        {"user_id": user_id},
+        {"verified_at": 1},      # project only the field we need
+    )
+
+    if not doc:
+        return False
+
+    verified_at = doc.get("verified_at")
+    if not verified_at:
+        return False
+
+    # MongoDB may return naive datetime — make tz-aware
+    if verified_at.tzinfo is None:
+        verified_at = verified_at.replace(tzinfo=timezone.utc)
+
+    elapsed_hours = (datetime.now(tz=timezone.utc) - verified_at).total_seconds() / 3600
+    valid = elapsed_hours < _ACCESS_HOURS
+
+    logger.info(
+        "[ACCESS] is_user_verified user_id=%s → %s | elapsed=%.1fh",
+        user_id, valid, elapsed_hours,
+    )
+    return valid
+
+
+def can_access(user_id: int) -> bool:
+    """
+    Single source of truth for file access control.
+
+    All file delivery must pass through this function.
+    Returns True only if user has a valid 24-hour verification token.
+    """
+    return is_user_verified(user_id)
