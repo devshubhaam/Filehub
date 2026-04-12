@@ -7,6 +7,7 @@ Collection: files
 
 import logging
 import os
+from datetime import datetime, timezone
 
 from pymongo import MongoClient
 from pymongo.collection import Collection
@@ -23,7 +24,8 @@ logger = logging.getLogger(__name__)
 
 _client: MongoClient | None = None
 _db: Database | None = None
-files_collection: Collection | None = None   # imported by other modules
+files_collection: Collection | None = None
+
 
 # ─── Public API ───────────────────────────────────────────────────────────────
 
@@ -31,21 +33,18 @@ def init_db() -> None:
     """
     Connect to MongoDB, initialise the `filebot` database and `files`
     collection, then run a quick smoke-test insert/fetch.
-
-    Call this once at application startup.
     """
     global _client, _db, files_collection
 
     mongo_uri = os.environ["MONGO_URI"]
 
-    logger.info("Connecting to MongoDB …")
+    logger.info("Connecting to MongoDB ...")
     _client = MongoClient(
         mongo_uri,
-        serverSelectionTimeoutMS=5_000,   # fail fast if unreachable
+        serverSelectionTimeoutMS=5_000,
         connectTimeoutMS=5_000,
     )
 
-    # Force a real connection attempt so we surface errors early.
     try:
         _client.admin.command("ping")
     except (ConnectionFailure, ServerSelectionTimeoutError) as exc:
@@ -55,8 +54,10 @@ def init_db() -> None:
     _db = _client["filebot"]
     files_collection = _db["files"]
 
-    logger.info("MongoDB connected — db=filebot, collection=files ✅")
+    # Ensure fast lookups by unique_id
+    files_collection.create_index("unique_id", unique=True)
 
+    logger.info("MongoDB connected — db=filebot, collection=files OK")
     _smoke_test()
 
 
@@ -67,15 +68,75 @@ def get_files_collection() -> Collection:
     return files_collection
 
 
+def save_file(unique_id: str, file_id: str) -> str:
+    """
+    Save or update a file record in MongoDB.
+
+    - If unique_id already exists  -> add file_id to file_ids array (no duplicates)
+    - If unique_id is new          -> insert fresh document
+
+    Returns:
+      "updated"  -- existing record, new file_id added
+      "inserted" -- brand new record created
+      "exists"   -- file_id was already present (no change)
+    """
+    col = get_files_collection()
+    now = datetime.now(tz=timezone.utc)
+
+    existing = col.find_one({"unique_id": unique_id})
+
+    if existing:
+        if file_id in existing.get("file_ids", []):
+            logger.info("file_id already exists for unique_id=%s -- skipping", unique_id)
+            return "exists"
+
+        col.update_one(
+            {"unique_id": unique_id},
+            {
+                "$addToSet": {"file_ids": file_id},
+                "$set":      {"updated_at": now},
+            },
+        )
+        logger.info("Updated unique_id=%s with new file_id OK", unique_id)
+        return "updated"
+
+    else:
+        col.insert_one(
+            {
+                "unique_id":  unique_id,
+                "file_ids":   [file_id],
+                "created_at": now,
+                "updated_at": now,
+            }
+        )
+        logger.info("Inserted new record unique_id=%s OK", unique_id)
+        return "inserted"
+
+
+def get_file(unique_id: str) -> dict | None:
+    """
+    Fetch a file document by unique_id.
+    Returns the full document or None if not found.
+    """
+    col = get_files_collection()
+    doc = col.find_one({"unique_id": unique_id})
+    if doc:
+        logger.info(
+            "Found unique_id=%s -- %d file_id(s) available",
+            unique_id,
+            len(doc.get("file_ids", [])),
+        )
+    else:
+        logger.warning("unique_id=%s not found in DB", unique_id)
+    return doc
+
+
 # ─── Internal helpers ─────────────────────────────────────────────────────────
 
 def _smoke_test() -> None:
     """Insert a test document and print it to confirm everything works."""
     col = get_files_collection()
-
     result = col.insert_one({"test": "ok"})
     doc = col.find_one({"_id": result.inserted_id})
-
-    # Pretty-print so it's visible in the startup log.
-    logger.info("MongoDB smoke-test document → %s", doc)
+    logger.info("MongoDB smoke-test document -> %s", doc)
     print(f"\n[DB SMOKE TEST] Inserted document: {doc}\n")
