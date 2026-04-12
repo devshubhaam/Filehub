@@ -3,8 +3,8 @@ helpers.py — Utility functions for the Telegram File Sharing Bot.
 
 Provides:
   - extract_unique_id(caption) → str
-  - generate_link(unique_id)   → str
-  - generate_shortlink(unique_id) → str
+  - generate_link(unique_id, bot_username) → str
+  - generate_shortlink(long_url) → str   (Linkshortify)
 """
 
 import logging
@@ -12,6 +12,11 @@ import os
 import random
 import re
 import string
+
+import requests as http_requests
+from dotenv import load_dotenv
+
+load_dotenv()
 
 logger = logging.getLogger(__name__)
 
@@ -27,8 +32,6 @@ _ID_LENGTH  = 9
 def extract_unique_id(caption: str | None) -> str:
     """
     Extract unique_id from a file caption.
-
-    Rules:
       - "ID: <value>" found → return <value>
       - Not found           → return random 9-char alphanumeric ID
     """
@@ -54,35 +57,47 @@ def generate_link(unique_id: str, bot_username: str) -> str:
     return link
 
 
+def generate_shortlink(long_url: str) -> str:
+    """
+    Shorten a URL using Linkshortify API.
+
+    API format:
+      GET https://linkshortify.com/api
+      Params: api=<key>, url=<target>, format=json
+
+    Success response:
+      { "status": "success", "shortenedUrl": "https://lksfy.com/xxxxx" }
+
+    Fallback: returns long_url unchanged if API fails or key missing.
+    """
+    api_key = os.environ.get("SHORTLINK_API", "")
+
+    if not api_key:
+        logger.warning("[SHORTLINK] SHORTLINK_API not set — using direct URL")
+        return long_url
+
     try:
         resp = http_requests.get(
-            api_url,
-            params={"api": api_key, "url": target_url},
+            "https://linkshortify.com/api",
+            params={"api": api_key, "url": long_url, "format": "json"},
             timeout=8,
         )
         resp.raise_for_status()
         data = resp.json()
 
-        # GPLinks / most providers return shortenedUrl or short_url
-        short = (
-            data.get("shortenedUrl")
-            or data.get("short_url")
-            or data.get("shortlink")
-            or data.get("result", {}).get("url")
-        )
+        if data.get("status") == "success":
+            short = data.get("shortenedUrl", "")
+            if short:
+                logger.info("[SHORTLINK] %s → %s", long_url, short)
+                return short
 
-        if short:
-            logger.info("[SHORTLINK] Generated: %s → %s", target_url, short)
-            return short
-
-        logger.warning("[SHORTLINK] Unexpected API response: %s", data)
+        logger.warning("[SHORTLINK] Unexpected response: %s", data)
 
     except Exception as exc:
-        logger.error("[SHORTLINK] API call failed: %s — using fallback", exc)
+        logger.error("[SHORTLINK] API error: %s — using fallback", exc)
 
-    # Fallback: return raw verify URL
-    logger.info("[SHORTLINK] Falling back to direct URL: %s", target_url)
-    return target_url
+    logger.info("[SHORTLINK] Fallback — returning original URL")
+    return long_url
 
 
 # ─── Internal helpers ─────────────────────────────────────────────────────────
