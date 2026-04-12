@@ -24,7 +24,7 @@ from collections import defaultdict
 
 import requests as http_requests
 from flask import Flask, Response, jsonify, request
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -52,6 +52,15 @@ from helpers import extract_unique_id, generate_link, shorten_url
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# ─── IST Timezone ─────────────────────────────────────────────────────────────
+
+from datetime import timedelta as _td
+_IST = timezone(_td(hours=5, minutes=30))
+
+def _fmt_ist(dt: datetime) -> str:
+    """UTC datetime → Indian Standard Time string."""
+    return dt.astimezone(_IST).strftime("%d %b %Y, %I:%M %p IST")
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
 
@@ -154,14 +163,10 @@ async def _handle_file_upload(
     logger.info("[UPLOAD][%s] unique_id=%s | %s", source, unique_id, status_msg)
 
     reply_text = (
-        f"✅ *File Saved Successfully*\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"🆔 *Unique ID:* `{unique_id}`\n"
-        f"📊 *Status:* {status_msg}\n\n"
-        f"🔗 *Permanent Link:*\n"
-        f"{link}\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"_Share the link above to give access to this file._"
+        f"✅ File saved!\n\n"
+        f"🆔 ID: `{unique_id}`\n"
+        f"📊 {status_msg}\n\n"
+        f"🔗 Link:\n{link}"
     )
     if update.message:
         await update.message.reply_text(reply_text, parse_mode="Markdown")
@@ -283,17 +288,15 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         grant_user_access(user_id, ttl_hours=ACCESS_TTL_HOURS)
 
         expiry     = get_access_expiry(user_id)
-        expiry_str = expiry.strftime("%d %b %Y, %I:%M %p UTC") if expiry else f"{ACCESS_TTL_HOURS} hours from now"
+        expiry_str = _fmt_ist(expiry) if expiry else f"{ACCESS_TTL_HOURS} hours from now"
 
         logger.info("[ACCESS] Granted %dhr | user_id=%s | expires=%s", ACCESS_TTL_HOURS, user_id, expiry_str)
 
         await update.message.reply_text(
-            f"✅ *Verification Successful!*\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"🎉 You now have *{ACCESS_TTL_HOURS}-hour free access* to all files!\n\n"
-            f"⏰ *Expires:* `{expiry_str}`\n\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"_Now open any file link — it will be sent instantly!_",
+            f"✅ Verification successful!\n\n"
+            f"You now have *{ACCESS_TTL_HOURS}-hour access* to all files.\n"
+            f"⏰ Expires: `{expiry_str}`\n\n"
+            f"Open any file link — it will be sent instantly!",
             parse_mode="Markdown",
         )
         return
@@ -318,11 +321,11 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             # ✅ Valid 24hr access hai — seedha file bhejo
             if has_valid_access(user_id):
                 expiry     = get_access_expiry(user_id)
-                expiry_str = expiry.strftime("%d %b, %I:%M %p UTC") if expiry else ""
+                expiry_str = _fmt_ist(expiry) if expiry else ""
                 logger.info("[ACCESS] Valid access | user_id=%s | unique_id=%s", user_id, unique_id)
                 await update.message.reply_text(
-                    f"✅ *Access Active* — sending your file...\n"
-                    f"_Valid until: {expiry_str}_",
+                    f"✅ Access verified — sending your file...\n"
+                    f"_Expires: {expiry_str}_",
                     parse_mode="Markdown",
                 )
                 await send_file_with_fallback(update, context, unique_id)
@@ -342,17 +345,17 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
             logger.info("[ACCESS] Sending verify link | user_id=%s | token=%s...", user_id, pending_token[:10])
 
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔓 Verify & Get Access", url=short_url)]
+            ])
+
             await update.message.reply_text(
-                f"🔐 *One-Time Verification Required*\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"Complete a quick verification to unlock *{ACCESS_TTL_HOURS} hours* of free access to all files.\n\n"
-                f"👇 *Tap below to verify:*\n"
-                f"{short_url}\n\n"
-                f"⏱ Link expires in *{minutes} minutes*\n\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"_After verifying, open any file link — it works instantly for {ACCESS_TTL_HOURS} hours!_",
+                f"🔐 *Verification Required*\n\n"
+                f"Tap the button below to complete a quick one-time verification "
+                f"and unlock *{ACCESS_TTL_HOURS} hours* of free access to all files.\n\n"
+                f"⏱ Link expires in {minutes} minutes.",
                 parse_mode="Markdown",
-                disable_web_page_preview=True,
+                reply_markup=keyboard,
             )
             return
 
@@ -369,20 +372,16 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if TOKEN_VERIFY_ENABLED:
         if has_valid_access(user_id):
             expiry     = get_access_expiry(user_id)
-            expiry_str = expiry.strftime("%d %b, %I:%M %p UTC") if expiry else ""
-            access_line = f"\n\n✅ *Access active* until `{expiry_str}`"
+            expiry_str = _fmt_ist(expiry) if expiry else ""
+            access_line = f"\n\n✅ Access active until `{expiry_str}`"
         else:
-            access_line = f"\n\n🔐 _Open a file link to verify and get {ACCESS_TTL_HOURS}hr access._"
+            access_line = f"\n\n🔐 Open a file link to verify and get {ACCESS_TTL_HOURS}hr access."
 
     await update.message.reply_text(
         f"👋 Welcome, {user.first_name}!\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🤖 *File Hub Bot*\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"I can securely deliver files to you via permanent links.\n\n"
-        f"📎 Simply open a file link and I'll send it directly here."
-        f"{access_line}\n\n"
-        f"_Powered by File Hub_",
+        f"I can securely deliver files to you via permanent links.\n"
+        f"Simply open a file link and I'll send it directly here."
+        f"{access_line}",
         parse_mode="Markdown",
     )
     logger.info("[USER] /start | user_id=%s", user_id)
