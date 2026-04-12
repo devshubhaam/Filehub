@@ -1,6 +1,13 @@
 """
 main.py — Telegram File Sharing Bot
-Entry point: initializes bot, Flask web server, and webhook.
+Final production build — Step 5.
+
+Features:
+  - File upload + permanent links   (Step 2)
+  - Self-healing fallback delivery  (Step 4)
+  - Views analytics                 (Step 5)
+  - User tracking                   (Step 5)
+  - Rate limiting / anti-spam       (Step 5)
 """
 
 import asyncio
@@ -8,6 +15,7 @@ import logging
 import os
 import threading
 import time
+from collections import defaultdict
 
 import requests as http_requests
 from flask import Flask, Response, jsonify, request
@@ -21,7 +29,14 @@ from telegram.ext import (
     filters,
 )
 
-from db import init_db, save_file, get_file, remove_file_id
+from db import (
+    init_db,
+    save_file,
+    get_file,
+    remove_file_id,
+    increment_views,
+    upsert_user,
+)
 from helpers import extract_unique_id, generate_link
 from dotenv import load_dotenv
 
@@ -46,6 +61,7 @@ MONGO_URI    = os.environ["MONGO_URI"]
 WEBHOOK_URL  = os.environ["WEBHOOK_URL"].rstrip("/")
 BOT_USERNAME = os.environ["BOT_USERNAME"]
 
+# Strict int set — only verified numeric IDs allowed
 ADMIN_IDS: set[int] = {
     int(uid.strip())
     for uid in os.environ.get("ADMIN_IDS", "").split(",")
@@ -54,6 +70,42 @@ ADMIN_IDS: set[int] = {
 
 WEBHOOK_PATH     = "/webhook"
 WEBHOOK_FULL_URL = f"{WEBHOOK_URL}{WEBHOOK_PATH}"
+
+# ─── Rate Limiter ─────────────────────────────────────────────────────────────
+
+# In-memory store: { user_id: [timestamp, timestamp, ...] }
+_user_requests: dict[int, list[float]] = defaultdict(list)
+
+RATE_LIMIT_MAX    = 5    # max requests
+RATE_LIMIT_WINDOW = 60   # per N seconds
+
+
+def _is_rate_limited(user_id: int) -> bool:
+    """
+    Return True if user has exceeded RATE_LIMIT_MAX requests
+    within the last RATE_LIMIT_WINDOW seconds.
+
+    Automatically cleans up old timestamps on every call.
+    """
+    now    = time.time()
+    window = now - RATE_LIMIT_WINDOW
+
+    # Keep only timestamps within the current window
+    _user_requests[user_id] = [
+        ts for ts in _user_requests[user_id] if ts > window
+    ]
+
+    if len(_user_requests[user_id]) >= RATE_LIMIT_MAX:
+        logger.warning(
+            "[RATE-LIMIT] user_id=%s exceeded %d req/%ds",
+            user_id, RATE_LIMIT_MAX, RATE_LIMIT_WINDOW,
+        )
+        return True
+
+    # Record this request
+    _user_requests[user_id].append(now)
+    return False
+
 
 # ─── Flask App ────────────────────────────────────────────────────────────────
 
@@ -68,7 +120,7 @@ bot_app: Application = (
     .build()
 )
 
-# ─── Dedicated event loop in its own thread ───────────────────────────────────
+# ─── Dedicated event loop ─────────────────────────────────────────────────────
 
 _event_loop = asyncio.new_event_loop()
 
@@ -84,26 +136,32 @@ _loop_thread = threading.Thread(
     daemon=True,
 )
 
-# ─── Upload Helper ────────────────────────────────────────────────────────────
+# ─── Admin Check ──────────────────────────────────────────────────────────────
 
 def _is_admin(user_id: int) -> bool:
+    """Strict check — user_id must be in ADMIN_IDS set."""
     return user_id in ADMIN_IDS
 
+
+# ─── Upload Handler ───────────────────────────────────────────────────────────
 
 async def _handle_file_upload(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     file_id: str,
     caption: str | None,
-    source: str = "user",
+    source: str = "admin",
 ) -> None:
     """
-    Core upload logic — shared by admin uploads and channel posts.
-    1. Extract/generate unique_id  2. Save to DB  3. Reply with link
+    Core upload flow (admin + channel):
+      1. Extract/generate unique_id from caption
+      2. Save file_id to MongoDB
+      3. Generate permanent link
+      4. Reply to admin / log for channel
     """
-    unique_id = extract_unique_id(caption)
-    result    = save_file(unique_id, file_id)
-    link      = generate_link(unique_id, BOT_USERNAME)
+    unique_id  = extract_unique_id(caption)
+    result     = save_file(unique_id, file_id)
+    link       = generate_link(unique_id, BOT_USERNAME)
 
     status_map = {
         "inserted": "New file saved",
@@ -112,7 +170,8 @@ async def _handle_file_upload(
     }
     status_msg = status_map.get(result, result)
 
-    logger.info("[%s] unique_id=%s | %s | link=%s", source, unique_id, status_msg, link)
+    logger.info("[UPLOAD][%s] unique_id=%s | %s | link=%s",
+                source, unique_id, status_msg, link)
 
     reply_text = (
         f"File saved successfully!\n\n"
@@ -124,7 +183,7 @@ async def _handle_file_upload(
     if update.message:
         await update.message.reply_text(reply_text)
     elif update.channel_post:
-        logger.info("Channel post processed: unique_id=%s link=%s", unique_id, link)
+        logger.info("[UPLOAD][channel] unique_id=%s | link=%s", unique_id, link)
 
 
 # ─── Self-Healing File Sender ─────────────────────────────────────────────────
@@ -135,40 +194,39 @@ async def send_file_with_fallback(
     unique_id: str,
 ) -> None:
     """
-    Try every file_id for unique_id until one works.
+    Deliver a file to the user using the self-healing fallback system.
 
-    For each file_id:
-      - Try send_document (works for video/audio/document via file_id)
-      - On success: log and stop
-      - On failure: log dead ID, remove from DB, try next
-
-    If all fail: inform user.
+    Algorithm:
+      For each file_id in DB (in order):
+        - Try to send
+        - Success → increment views, log, stop
+        - Failure → log dead ID, remove from DB, try next
+      All failed → notify user
     """
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
 
-    # 1. Fetch document
+    # 1. Fetch document from DB
     doc = get_file(unique_id)
 
     if not doc:
-        logger.warning("[FALLBACK] unique_id=%s not found | user_id=%s", unique_id, user_id)
+        logger.warning("[DELIVERY] unique_id=%s not found | user_id=%s", unique_id, user_id)
         await update.message.reply_text("File not found.")
         return
 
     file_ids: list[str] = list(doc.get("file_ids", []))
 
-    # 2. Empty list check
     if not file_ids:
-        logger.warning("[FALLBACK] unique_id=%s has no file_ids | user_id=%s", unique_id, user_id)
+        logger.warning("[DELIVERY] unique_id=%s has no file_ids | user_id=%s", unique_id, user_id)
         await update.message.reply_text("File unavailable.")
         return
 
     logger.info(
-        "[FALLBACK] Attempting delivery: unique_id=%s | %d file_id(s) | user_id=%s",
+        "[DELIVERY] Starting delivery: unique_id=%s | %d file_id(s) | user_id=%s",
         unique_id, len(file_ids), user_id,
     )
 
-    # 3. Loop through all file_ids
+    # 2. Try each file_id
     sent = False
     for index, file_id in enumerate(file_ids):
         try:
@@ -178,37 +236,33 @@ async def send_file_with_fallback(
             )
 
             # Success
-            if index == 0:
-                logger.info(
-                    "[FALLBACK] Sent primary file_id | unique_id=%s | user_id=%s",
-                    unique_id, user_id,
-                )
-            else:
-                logger.info(
-                    "[FALLBACK] Fallback used (index=%d) | unique_id=%s | user_id=%s",
-                    index, unique_id, user_id,
-                )
+            label = "primary" if index == 0 else f"fallback (index={index})"
+            logger.info(
+                "[DELIVERY] Sent via %s | unique_id=%s | user_id=%s",
+                label, unique_id, user_id,
+            )
+
+            # Increment analytics counter
+            increment_views(unique_id)
 
             sent = True
             break
 
         except Exception as exc:
-            # Dead file_id — log, remove, continue
             logger.warning(
-                "[FALLBACK] Dead file_id detected (index=%d) | unique_id=%s | error=%s",
+                "[SELF-HEAL] Dead file_id detected (index=%d) | unique_id=%s | error=%s",
                 index, unique_id, exc,
             )
             remove_file_id(unique_id, file_id)
             logger.info(
-                "[FALLBACK] Dead file_id removed from DB | unique_id=%s",
+                "[SELF-HEAL] Dead file_id removed from DB | unique_id=%s",
                 unique_id,
             )
-            continue
 
-    # 4. All failed
+    # 3. All failed
     if not sent:
         logger.error(
-            "[FALLBACK] All file_ids exhausted | unique_id=%s | user_id=%s",
+            "[DELIVERY] All file_ids exhausted | unique_id=%s | user_id=%s",
             unique_id, user_id,
         )
         await update.message.reply_text(
@@ -216,35 +270,53 @@ async def send_file_with_fallback(
         )
 
 
-# ─── Telegram Command Handlers ────────────────────────────────────────────────
+# ─── Telegram Handlers ────────────────────────────────────────────────────────
 
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    /start             — plain greeting
-    /start file_<id>   — deliver file with self-healing fallback
+    /start           — greeting + user tracking
+    /start file_<id> — rate-limit check → user tracking → file delivery
     """
-    args = context.args
+    user    = update.effective_user
+    user_id = user.id
+    args    = context.args
 
-    # Deep-link: /start file_<unique_id>
+    # ── File deep-link ────────────────────────────────────────────────────────
     if args and args[0].startswith("file_"):
         unique_id = args[0][len("file_"):]
+
+        # 1. Rate limit check
+        if _is_rate_limited(user_id):
+            await update.message.reply_text(
+                "Too many requests, slow down."
+            )
+            return
+
+        # 2. Track user activity
+        status = upsert_user(user_id, first_name=user.first_name or "")
         logger.info(
-            "File request: unique_id=%s | user_id=%s",
-            unique_id, update.effective_user.id,
+            "[USER] %s user | user_id=%s | unique_id=%s",
+            status, user_id, unique_id,
         )
+
+        # 3. Deliver file
+        logger.info("[DELIVERY] Request: unique_id=%s | user_id=%s", unique_id, user_id)
         await send_file_with_fallback(update, context, unique_id)
         return
 
-    # Plain /start
+    # ── Plain /start ──────────────────────────────────────────────────────────
+    upsert_user(user_id, first_name=user.first_name or "")
     await update.message.reply_text("Bot is running successfully!")
-    logger.info("/start from user_id=%s", update.effective_user.id)
+    logger.info("[USER] /start from user_id=%s", user_id)
 
 
 async def upload_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle file uploads from admins (video / document / audio)."""
+    """Handle file uploads from admins only (video / document / audio)."""
     user = update.effective_user
+
+    # Strict admin check
     if not _is_admin(user.id):
-        logger.warning("Unauthorized upload attempt from user_id=%s", user.id)
+        logger.warning("[SECURITY] Unauthorized upload attempt from user_id=%s", user.id)
         await update.message.reply_text("You are not authorized to upload files.")
         return
 
@@ -258,14 +330,14 @@ async def upload_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     elif msg.audio:
         file_id, file_type = msg.audio.file_id, "audio"
     else:
-        return
+        return  # unsupported type
 
-    logger.info("Admin upload: type=%s user_id=%s caption=%r", file_type, user.id, caption)
+    logger.info("[UPLOAD] type=%s | user_id=%s | caption=%r", file_type, user.id, caption)
     await _handle_file_upload(update, context, file_id, caption, source="admin")
 
 
 async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle file uploads posted directly to a channel."""
+    """Handle file uploads posted directly to a linked channel."""
     post    = update.channel_post
     caption = post.caption
 
@@ -278,7 +350,7 @@ async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     else:
         return
 
-    logger.info("Channel post upload: type=%s chat=%s caption=%r",
+    logger.info("[UPLOAD][channel] type=%s | chat=%s | caption=%r",
                 file_type, post.chat.id, caption)
     await _handle_file_upload(update, context, file_id, caption, source="channel")
 
@@ -312,7 +384,7 @@ def webhook() -> Response:
     return jsonify({"ok": True}), 200
 
 
-# ─── Startup Helpers ──────────────────────────────────────────────────────────
+# ─── Startup ──────────────────────────────────────────────────────────────────
 
 async def register_handlers() -> None:
     bot_app.add_handler(CommandHandler("start", start_handler))
@@ -348,6 +420,7 @@ async def startup() -> None:
 # ─── Keep-Alive ───────────────────────────────────────────────────────────────
 
 def keep_alive() -> None:
+    """Ping own health endpoint every 10 min to prevent Render sleep."""
     while True:
         time.sleep(600)
         try:
