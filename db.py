@@ -55,7 +55,7 @@ def init_db() -> None:
     files_collection = _db["files"]
 
     # Ensure fast lookups by unique_id
-    files_collection.create_index("unique_id", unique=True)
+    files_collection.create_index("unique_id", unique=True, sparse=True)
 
     logger.info("MongoDB connected — db=filebot, collection=files OK")
     _smoke_test()
