@@ -21,7 +21,7 @@ from telegram.ext import (
     filters,
 )
 
-from db import init_db, save_file, get_file
+from db import init_db, save_file, get_file, remove_file_id
 from helpers import extract_unique_id, generate_link
 from dotenv import load_dotenv
 
@@ -46,7 +46,6 @@ MONGO_URI    = os.environ["MONGO_URI"]
 WEBHOOK_URL  = os.environ["WEBHOOK_URL"].rstrip("/")
 BOT_USERNAME = os.environ["BOT_USERNAME"]
 
-# Parse comma-separated admin IDs  e.g. "123456789,987654321"
 ADMIN_IDS: set[int] = {
     int(uid.strip())
     for uid in os.environ.get("ADMIN_IDS", "").split(",")
@@ -85,10 +84,9 @@ _loop_thread = threading.Thread(
     daemon=True,
 )
 
-# ─── Helpers ──────────────────────────────────────────────────────────────────
+# ─── Upload Helper ────────────────────────────────────────────────────────────
 
 def _is_admin(user_id: int) -> bool:
-    """Return True if user_id is in the ADMIN_IDS set."""
     return user_id in ADMIN_IDS
 
 
@@ -100,12 +98,8 @@ async def _handle_file_upload(
     source: str = "user",
 ) -> None:
     """
-    Core upload logic — shared by both user uploads and channel posts.
-
-    1. Extract / generate unique_id from caption
-    2. Save to MongoDB
-    3. Generate permanent link
-    4. Reply with link (user) or log (channel)
+    Core upload logic — shared by admin uploads and channel posts.
+    1. Extract/generate unique_id  2. Save to DB  3. Reply with link
     """
     unique_id = extract_unique_id(caption)
     result    = save_file(unique_id, file_id)
@@ -130,57 +124,124 @@ async def _handle_file_upload(
     if update.message:
         await update.message.reply_text(reply_text)
     elif update.channel_post:
-        # For channel posts just log — replying to channels is not always possible
         logger.info("Channel post processed: unique_id=%s link=%s", unique_id, link)
+
+
+# ─── Self-Healing File Sender ─────────────────────────────────────────────────
+
+async def send_file_with_fallback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    unique_id: str,
+) -> None:
+    """
+    Try every file_id for unique_id until one works.
+
+    For each file_id:
+      - Try send_document (works for video/audio/document via file_id)
+      - On success: log and stop
+      - On failure: log dead ID, remove from DB, try next
+
+    If all fail: inform user.
+    """
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+
+    # 1. Fetch document
+    doc = get_file(unique_id)
+
+    if not doc:
+        logger.warning("[FALLBACK] unique_id=%s not found | user_id=%s", unique_id, user_id)
+        await update.message.reply_text("File not found.")
+        return
+
+    file_ids: list[str] = list(doc.get("file_ids", []))
+
+    # 2. Empty list check
+    if not file_ids:
+        logger.warning("[FALLBACK] unique_id=%s has no file_ids | user_id=%s", unique_id, user_id)
+        await update.message.reply_text("File unavailable.")
+        return
+
+    logger.info(
+        "[FALLBACK] Attempting delivery: unique_id=%s | %d file_id(s) | user_id=%s",
+        unique_id, len(file_ids), user_id,
+    )
+
+    # 3. Loop through all file_ids
+    sent = False
+    for index, file_id in enumerate(file_ids):
+        try:
+            await context.bot.send_document(
+                chat_id=chat_id,
+                document=file_id,
+            )
+
+            # Success
+            if index == 0:
+                logger.info(
+                    "[FALLBACK] Sent primary file_id | unique_id=%s | user_id=%s",
+                    unique_id, user_id,
+                )
+            else:
+                logger.info(
+                    "[FALLBACK] Fallback used (index=%d) | unique_id=%s | user_id=%s",
+                    index, unique_id, user_id,
+                )
+
+            sent = True
+            break
+
+        except Exception as exc:
+            # Dead file_id — log, remove, continue
+            logger.warning(
+                "[FALLBACK] Dead file_id detected (index=%d) | unique_id=%s | error=%s",
+                index, unique_id, exc,
+            )
+            remove_file_id(unique_id, file_id)
+            logger.info(
+                "[FALLBACK] Dead file_id removed from DB | unique_id=%s",
+                unique_id,
+            )
+            continue
+
+    # 4. All failed
+    if not sent:
+        logger.error(
+            "[FALLBACK] All file_ids exhausted | unique_id=%s | user_id=%s",
+            unique_id, user_id,
+        )
+        await update.message.reply_text(
+            "File is currently unavailable. Please contact admin."
+        )
 
 
 # ─── Telegram Command Handlers ────────────────────────────────────────────────
 
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    /start  — plain greeting
-    /start file_<unique_id>  — send the requested file
+    /start             — plain greeting
+    /start file_<id>   — deliver file with self-healing fallback
     """
-    args = context.args  # list of words after /start
+    args = context.args
 
-    # ── Deep-link: /start file_<unique_id> ────────────────────────────────────
+    # Deep-link: /start file_<unique_id>
     if args and args[0].startswith("file_"):
-        unique_id = args[0][len("file_"):]   # strip "file_" prefix
-        logger.info("File request: unique_id=%s from user_id=%s",
-                    unique_id, update.effective_user.id)
-
-        doc = get_file(unique_id)
-
-        if not doc or not doc.get("file_ids"):
-            await update.message.reply_text("File not found. It may have been removed.")
-            return
-
-        # Send the first (primary) file_id
-        file_id = doc["file_ids"][0]
-        try:
-            await context.bot.send_document(
-                chat_id=update.effective_chat.id,
-                document=file_id,
-            )
-            logger.info("Sent file unique_id=%s to user_id=%s",
-                        unique_id, update.effective_user.id)
-        except Exception as exc:
-            logger.error("Failed to send file unique_id=%s: %s", unique_id, exc)
-            await update.message.reply_text(
-                "Could not send the file. Please try again later."
-            )
+        unique_id = args[0][len("file_"):]
+        logger.info(
+            "File request: unique_id=%s | user_id=%s",
+            unique_id, update.effective_user.id,
+        )
+        await send_file_with_fallback(update, context, unique_id)
         return
 
-    # ── Plain /start ──────────────────────────────────────────────────────────
+    # Plain /start
     await update.message.reply_text("Bot is running successfully!")
     logger.info("/start from user_id=%s", update.effective_user.id)
 
 
 async def upload_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Handle file uploads from admins (video / document / audio).
-    Non-admins are silently ignored.
-    """
+    """Handle file uploads from admins (video / document / audio)."""
     user = update.effective_user
     if not _is_admin(user.id):
         logger.warning("Unauthorized upload attempt from user_id=%s", user.id)
@@ -188,44 +249,34 @@ async def upload_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     msg     = update.message
-    caption = msg.caption  # may be None
+    caption = msg.caption
 
-    # Determine file type and extract file_id
     if msg.document:
-        file_id   = msg.document.file_id
-        file_type = "document"
+        file_id, file_type = msg.document.file_id, "document"
     elif msg.video:
-        file_id   = msg.video.file_id
-        file_type = "video"
+        file_id, file_type = msg.video.file_id, "video"
     elif msg.audio:
-        file_id   = msg.audio.file_id
-        file_type = "audio"
+        file_id, file_type = msg.audio.file_id, "audio"
     else:
-        return  # unsupported type — ignore
+        return
 
     logger.info("Admin upload: type=%s user_id=%s caption=%r", file_type, user.id, caption)
     await _handle_file_upload(update, context, file_id, caption, source="admin")
 
 
 async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Handle file uploads posted directly to a channel.
-    The bot must be an admin of that channel.
-    """
+    """Handle file uploads posted directly to a channel."""
     post    = update.channel_post
     caption = post.caption
 
     if post.document:
-        file_id   = post.document.file_id
-        file_type = "document"
+        file_id, file_type = post.document.file_id, "document"
     elif post.video:
-        file_id   = post.video.file_id
-        file_type = "video"
+        file_id, file_type = post.video.file_id, "video"
     elif post.audio:
-        file_id   = post.audio.file_id
-        file_type = "audio"
+        file_id, file_type = post.audio.file_id, "audio"
     else:
-        return  # not a file post
+        return
 
     logger.info("Channel post upload: type=%s chat=%s caption=%r",
                 file_type, post.chat.id, caption)
@@ -264,20 +315,15 @@ def webhook() -> Response:
 # ─── Startup Helpers ──────────────────────────────────────────────────────────
 
 async def register_handlers() -> None:
-    # /start (with optional deep-link arg)
     bot_app.add_handler(CommandHandler("start", start_handler))
 
-    # Admin uploads — private/group messages
     file_filter = filters.Document.ALL | filters.VIDEO | filters.AUDIO
     bot_app.add_handler(MessageHandler(file_filter, upload_handler))
 
-    # Channel posts
     channel_file_filter = (
         filters.Document.ALL | filters.VIDEO | filters.AUDIO
     ) & filters.ChatType.CHANNEL
-    bot_app.add_handler(
-        MessageHandler(channel_file_filter, channel_post_handler)
-    )
+    bot_app.add_handler(MessageHandler(channel_file_filter, channel_post_handler))
 
     logger.info("Handlers registered OK")
 
