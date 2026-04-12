@@ -54,7 +54,7 @@ def init_db() -> None:
     _db = _client["filebot"]
     files_collection = _db["files"]
 
-    # Ensure fast lookups by unique_id
+    # sparse=True ignores docs where unique_id is null (e.g. smoke-test docs)
     files_collection.create_index("unique_id", unique=True, sparse=True)
 
     logger.info("MongoDB connected — db=filebot, collection=files OK")
@@ -71,9 +71,6 @@ def get_files_collection() -> Collection:
 def save_file(unique_id: str, file_id: str) -> str:
     """
     Save or update a file record in MongoDB.
-
-    - If unique_id already exists  -> add file_id to file_ids array (no duplicates)
-    - If unique_id is new          -> insert fresh document
 
     Returns:
       "updated"  -- existing record, new file_id added
@@ -129,6 +126,36 @@ def get_file(unique_id: str) -> dict | None:
     else:
         logger.warning("unique_id=%s not found in DB", unique_id)
     return doc
+
+
+def remove_file_id(unique_id: str, file_id: str) -> None:
+    """
+    Remove a single dead file_id from the file_ids array in MongoDB.
+
+    Uses $pull to surgically remove just that one entry.
+    Also updates updated_at timestamp for audit trail.
+    """
+    col = get_files_collection()
+    now = datetime.now(tz=timezone.utc)
+
+    result = col.update_one(
+        {"unique_id": unique_id},
+        {
+            "$pull": {"file_ids": file_id},
+            "$set":  {"updated_at": now},
+        },
+    )
+
+    if result.modified_count:
+        logger.info(
+            "[SELF-HEAL] Removed dead file_id from unique_id=%s | file_id=%s",
+            unique_id, file_id,
+        )
+    else:
+        logger.warning(
+            "[SELF-HEAL] remove_file_id: unique_id=%s not found or file_id not in array",
+            unique_id,
+        )
 
 
 # ─── Internal helpers ─────────────────────────────────────────────────────────
