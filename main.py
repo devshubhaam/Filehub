@@ -122,13 +122,13 @@ async def _handle_file_upload(
 
     reply_text = (
         f"File saved successfully!\n\n"
-        f"Unique ID : `{unique_id}`\n"
+        f"Unique ID : {unique_id}\n"
         f"Status    : {status_msg}\n\n"
         f"Permanent Link:\n{link}"
     )
 
     if update.message:
-        await update.message.reply_text(reply_text, parse_mode="Markdown")
+        await update.message.reply_text(reply_text)
     elif update.channel_post:
         # For channel posts just log — replying to channels is not always possible
         logger.info("Channel post processed: unique_id=%s link=%s", unique_id, link)
