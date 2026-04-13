@@ -434,3 +434,51 @@ def is_premium(user_id: int) -> bool:
     result = valid_until > datetime.now(tz=timezone.utc)
     logger.info("[PREMIUM] is_premium user_id=%s → %s", user_id, result)
     return result
+
+# ─── Referral API ─────────────────────────────────────────────────────────────
+
+def use_referral(referrer_id: int, referred_user_id: int) -> bool:
+    """
+    Record a referral and give the new user 24-hour verified access.
+
+    Rules:
+      - A user can only be referred once (first join counts)
+      - Referrer cannot refer themselves
+
+    Returns True if referral was applied, False if already used or self-referral.
+    """
+    if _db is None:
+        raise RuntimeError("Database not initialised — call init_db() first.")
+
+    # Prevent self-referral
+    if referrer_id == referred_user_id:
+        logger.warning("[REFERRAL] Self-referral blocked | user_id=%s", referrer_id)
+        return False
+
+    # Check if user was already referred
+    existing = _db["referrals"].find_one({"referred_user": referred_user_id})
+    if existing:
+        logger.info("[REFERRAL] Already referred | referred_user=%s", referred_user_id)
+        return False
+
+    now = datetime.now(tz=timezone.utc)
+
+    # Store referral record
+    _db["referrals"].insert_one({
+        "referrer_id":   referrer_id,
+        "referred_user": referred_user_id,
+        "timestamp":     now,
+    })
+
+    # Give referred user 24-hour verified access (reuse verified_users collection)
+    _db["verified_users"].update_one(
+        {"user_id": referred_user_id},
+        {"$set": {"user_id": referred_user_id, "verified_at": now}},
+        upsert=True,
+    )
+
+    logger.info(
+        "[REFERRAL] Applied | referrer_id=%s → referred_user=%s | 24h access granted",
+        referrer_id, referred_user_id,
+    )
+    return True
