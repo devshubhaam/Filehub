@@ -85,7 +85,14 @@ SHORTLINK_API    = os.environ.get("SHORTLINK_API", "")
 UPI_ID           = os.environ.get("UPI_ID", "yourname@upi")
 PREMIUM_AMOUNT   = os.environ.get("PREMIUM_AMOUNT", "49")
 UPI_QR_FILE      = os.environ.get("UPI_QR_FILE", "")
-UPI_QR_URL       = os.environ.get("UPI_QR_URL", "https://i.ibb.co/rRG680k1/Account-QRCode-AIRP-5423-DARK-THEME.png")
+
+# ── Separate image URL for each message type ──────────────────────────────────
+IMG_WELCOME      = os.environ.get("IMG_WELCOME",      "https://i.ibb.co/rRG680k1/Account-QRCode-AIRP-5423-DARK-THEME.png")
+IMG_ACCESS       = os.environ.get("IMG_ACCESS",       "https://i.ibb.co/rRG680k1/Account-QRCode-AIRP-5423-DARK-THEME.png")
+IMG_VERIFY       = os.environ.get("IMG_VERIFY",       "https://i.ibb.co/rRG680k1/Account-QRCode-AIRP-5423-DARK-THEME.png")
+IMG_PREMIUM      = os.environ.get("IMG_PREMIUM",      "https://i.ibb.co/rRG680k1/Account-QRCode-AIRP-5423-DARK-THEME.png")
+IMG_REFERRAL     = os.environ.get("IMG_REFERRAL",     "https://i.ibb.co/rRG680k1/Account-QRCode-AIRP-5423-DARK-THEME.png")
+UPI_QR_URL       = os.environ.get("UPI_QR_URL",       "https://i.ibb.co/rRG680k1/Account-QRCode-AIRP-5423-DARK-THEME.png")
 
 WEBHOOK_PATH     = "/webhook"
 WEBHOOK_FULL_URL = f"{WEBHOOK_URL}{WEBHOOK_PATH}"
@@ -161,6 +168,40 @@ def _is_admin(user_id: int) -> bool:
     """Strict check — user_id must be in ADMIN_IDS set."""
     return user_id in ADMIN_IDS
 
+
+
+# ─── Image Send Helper ────────────────────────────────────────────────────────
+
+async def _send_image_msg(
+    target,          # update.message or context.bot
+    chat_id: int,
+    img_url: str,
+    text: str,
+    parse_mode: str = "Markdown",
+    reply_markup=None,
+    is_bot: bool = False,
+) -> None:
+    """Send a photo+caption if img_url set, else send text. Fallback to text on error."""
+    kwargs = dict(caption=text, parse_mode=parse_mode)
+    if reply_markup:
+        kwargs["reply_markup"] = reply_markup
+    if img_url:
+        try:
+            if is_bot:
+                await target.send_photo(chat_id=chat_id, photo=img_url, **kwargs)
+            else:
+                await target.reply_photo(photo=img_url, **kwargs)
+            return
+        except Exception as exc:
+            logger.warning("[IMG] Photo send failed: %s — falling back to text", exc)
+    # Fallback
+    txt_kwargs = dict(text=text, parse_mode=parse_mode)
+    if reply_markup:
+        txt_kwargs["reply_markup"] = reply_markup
+    if is_bot:
+        await target.send_message(chat_id=chat_id, **txt_kwargs)
+    else:
+        await target.reply_text(**txt_kwargs)
 
 # ─── Upload Handler ───────────────────────────────────────────────────────────
 
@@ -379,21 +420,11 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                             referrer_id, user_id)
                 ref_text = (
                     "🎁 *Welcome!*\n\n"
-                    "*You joined via a referral link.*\n\n"
-                    "✅ *24-hour free access has been activated!*\n\n"
-                    "_You can now access all files for the next 24 hours._"
+                    "> You joined via a referral link\n\n"
+                    "✅ *24-hour free access activated!*\n\n"
+                    "_You can now access all files for the next 24 hours_"
                 )
-                if UPI_QR_URL:
-                    try:
-                        await update.message.reply_photo(
-                            photo=UPI_QR_URL,
-                            caption=ref_text,
-                            parse_mode="Markdown",
-                        )
-                    except Exception:
-                        await update.message.reply_text(ref_text, parse_mode="Markdown")
-                else:
-                    await update.message.reply_text(ref_text, parse_mode="Markdown")
+                await _send_image_msg(update.message, user_id, IMG_REFERRAL, ref_text, parse_mode="Markdown")
             else:
                 await update.message.reply_text(
                     "👋 *Welcome back!*\n\n"
@@ -415,20 +446,10 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
         verify_text = (
             "✅ *Verification Successful!*\n\n"
-            "*You now have 24-hour access to ALL files.*\n\n"
+            "> You now have 24-hour access to ALL files\n\n"
             "_Sending your file now..._"
         )
-        if UPI_QR_URL:
-            try:
-                await update.message.reply_photo(
-                    photo=UPI_QR_URL,
-                    caption=verify_text,
-                    parse_mode="Markdown",
-                )
-            except Exception:
-                await update.message.reply_text(verify_text, parse_mode="Markdown")
-        else:
-            await update.message.reply_text(verify_text, parse_mode="Markdown")
+        await _send_image_msg(update.message, user_id, IMG_VERIFY, verify_text, parse_mode="Markdown")
 
         # Check if User 2 was referred — if so reward User 1 (referrer)
         referrer_id = reward_referrer(user_id)
@@ -503,24 +524,17 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
         access_text = (
             "🔐 *Access Required*\n\n"
-            "*Choose an option to access this file:*\n\n"
-            "✅ *Verify Now* — Free, valid 24 hours\n"
-            + ("" if is_premium(user_id) else "💎 *Premium* — Pay once, access for 30 days\n")
-            + "🎁 *Referral* — Get a friend\'s referral for free 24h access"
+            "> Choose how you want to access this file\n\n"
+            "✅ *Verify Now* \— Free, valid 24 hours\n"
+            + ("" if is_premium(user_id) else "💎 *Premium* \— Pay once, 30 days access\n")
+            + "🎁 *Referral* \— Friend\'s referral for free 24h"
         )
 
-        if UPI_QR_URL:
-            try:
-                await update.message.reply_photo(
-                    photo=UPI_QR_URL,
-                    caption=access_text,
-                    parse_mode="Markdown",
-                    reply_markup=keyboard,
-                )
-                return
-            except Exception:
-                pass
-        await update.message.reply_text(access_text, parse_mode="Markdown", reply_markup=keyboard)
+        await _send_image_msg(
+            update.message, user_id, IMG_ACCESS,
+            access_text, parse_mode="Markdown",
+            reply_markup=keyboard,
+        )
         return
 
     # ── Deep-link: /start buy → show /buy ───────────────────────────────────
@@ -538,28 +552,17 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     welcome_text = (
         f"👋 *Hey {user.first_name}!*\n\n"
-        f"🤖 *File Hub Bot*\n\n"
-        f"📂 I securely store and deliver files via permanent links.\n\n"
-        f"📎 Just open a file link and I will send it directly to you here.\n\n"
+        f"*File Hub Bot*\n"
+        f"> 📂 Securely store and deliver files via permanent links\n"
+        f"> 📎 Open any file link and I'll send it directly here\n"
+        f"> 🔒 Files auto-delete after 10 minutes\n\n"
+        f"*What you can do:*\n"
         f"💎 /buy — Get 30-day Premium access\n"
-        f"🎁 /referral — Share your referral link\n\n"
-        f"🔒 _Files are auto-deleted after 10 minutes for your privacy._"
+        f"🎁 /referral — Share your referral link\n"
+        f"💰 /paid <UTR> — Submit payment after buying"
     )
 
-    welcome_img = UPI_QR_URL  # reuse QR URL; change UPI_QR_URL in .env for a different image
-    if welcome_img:
-        try:
-            await update.message.reply_photo(
-                photo=welcome_img,
-                caption=welcome_text,
-                parse_mode="Markdown",
-            )
-            logger.info("[USER] /start with image from user_id=%s", user_id)
-            return
-        except Exception as exc:
-            logger.warning("[USER] Welcome image failed: %s — sending text only", exc)
-
-    await update.message.reply_text(welcome_text, parse_mode="Markdown")
+    await _send_image_msg(update.message, user_id, IMG_WELCOME, welcome_text, parse_mode="Markdown")
     logger.info("[USER] /start from user_id=%s", user_id)
 
 
@@ -620,37 +623,35 @@ async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 async def buy_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     /buy — Show UPI payment details with QR code.
+    If already premium → show premium status instead.
     """
     user = update.effective_user
 
+    # Already premium — no need to buy again
+    if is_premium(user.id):
+        already_text = (
+            "💎 *You Are Already Premium!*\n\n"
+            "> Your premium access is currently active\n\n"
+            "_Enjoy unlimited access to all files for the remainder of your 30-day plan._\n\n"
+            "You do not need to purchase again."
+        )
+        await _send_image_msg(update.message, user.id, IMG_PREMIUM, already_text, parse_mode="Markdown")
+        return
+
     caption = (
         f"💎 *Get Premium Access*\n\n"
-        f"👤 *For:* {user.first_name}\n\n"
+        f"> 👤 For: {user.first_name}\n\n"
         f"💰 *Amount:* ₹{PREMIUM_AMOUNT}\n"
         f"📲 *UPI ID:* `{UPI_ID}`\n\n"
         f"📋 *Steps:*\n"
         f"1️⃣ Pay ₹{PREMIUM_AMOUNT} to the UPI ID above\n"
         f"2️⃣ Note your UTR / Transaction ID\n"
-        f"3️⃣ Send `/paid <UTR>` to confirm\n\n"
+        f"3️⃣ Send /paid <UTR> to confirm\n\n"
         f"⏳ *Access:* 30 days after approval\n\n"
         f"_Example: /paid 123456789012_"
     )
 
-    # Send QR via URL (fastest, no file needed)
-    qr_url = UPI_QR_URL or UPI_QR_FILE
-    if qr_url:
-        try:
-            await update.message.reply_photo(
-                photo=qr_url,
-                caption=caption,
-                parse_mode="Markdown",
-            )
-            logger.info("[BUY] /buy with QR sent to user_id=%s", user.id)
-            return
-        except Exception as exc:
-            logger.warning("[BUY] QR send error: %s — sending text only", exc)
-
-    await update.message.reply_text(caption, parse_mode="Markdown")
+    await _send_image_msg(update.message, user.id, UPI_QR_URL or UPI_QR_FILE, caption)
     logger.info("[BUY] /buy sent to user_id=%s", user.id)
 
 
@@ -772,30 +773,14 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         try:
             approved_text = (
                 "🎉 *Payment Approved!*\n\n"
-                "*Your Premium access has been activated.*\n\n"
-                "⏳ *Valid for 30 days.*\n\n"
-                "_You now have unlimited access to all files._"
+                "> Your Premium access has been activated\n\n"
+                "⏳ *Valid for 30 days*\n\n"
+                "_You now have unlimited access to all files_"
             )
-            if UPI_QR_URL:
-                try:
-                    await context.bot.send_photo(
-                        chat_id=user_id,
-                        photo=UPI_QR_URL,
-                        caption=approved_text,
-                        parse_mode="Markdown",
-                    )
-                except Exception:
-                    await context.bot.send_message(
-                        chat_id=user_id,
-                        text=approved_text,
-                        parse_mode="Markdown",
-                    )
-            else:
-                await context.bot.send_message(
-                    chat_id=user_id,
-                    text=approved_text,
-                    parse_mode="Markdown",
-                )
+            await _send_image_msg(
+                context.bot, user_id, IMG_PREMIUM,
+                approved_text, parse_mode="Markdown", is_bot=True,
+            )
         except Exception as exc:
             logger.warning("[PAYMENT] Could not notify user_id=%s: %s", user_id, exc)
 
