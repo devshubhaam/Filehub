@@ -85,6 +85,7 @@ UPI_ID           = os.environ.get("UPI_ID", "yourname@upi")
 PREMIUM_AMOUNT   = os.environ.get("PREMIUM_AMOUNT", "49")
 UPI_QR_FILE      = os.environ.get("UPI_QR_FILE", "")
 UPI_QR_URL       = os.environ.get("UPI_QR_URL", "https://i.ibb.co/rRG680k1/Account-QRCode-AIRP-5423-DARK-THEME.png")
+Start_Img       = os.environ.get("Start_Img", "")
 
 WEBHOOK_PATH     = "/webhook"
 WEBHOOK_FULL_URL = f"{WEBHOOK_URL}{WEBHOOK_PATH}"
@@ -511,7 +512,7 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"🔒 _Files are auto-deleted after 10 minutes for your privacy._"
     )
 
-    welcome_img = UPI_QR_URL  # reuse QR URL; change UPI_QR_URL in .env for a different image
+    welcome_img = Start_Img  # reuse QR URL; change UPI_QR_URL in .env for a different image
     if welcome_img:
         try:
             await update.message.reply_photo(
