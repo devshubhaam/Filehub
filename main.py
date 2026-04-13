@@ -49,6 +49,14 @@ from db import (
     use_referral,
     reward_referrer,
     run_cleanup,
+    get_bot_stats,
+    get_file_stats,
+    get_user_status,
+    ban_user,
+    unban_user,
+    is_banned,
+    get_force_join_channel,
+    get_all_user_ids,
 )
 from helpers import extract_unique_id, generate_link, generate_shortlink
 from dotenv import load_dotenv
@@ -93,6 +101,8 @@ IMG_VERIFY       = os.environ.get("IMG_VERIFY",       "https://i.ibb.co/rRG680k1
 IMG_PREMIUM      = os.environ.get("IMG_PREMIUM",      "https://i.ibb.co/rRG680k1/Account-QRCode-AIRP-5423-DARK-THEME.png")
 IMG_REFERRAL     = os.environ.get("IMG_REFERRAL",     "https://i.ibb.co/rRG680k1/Account-QRCode-AIRP-5423-DARK-THEME.png")
 UPI_QR_URL       = os.environ.get("UPI_QR_URL",       "https://i.ibb.co/rRG680k1/Account-QRCode-AIRP-5423-DARK-THEME.png")
+
+FORCE_JOIN_CHANNEL = os.environ.get("FORCE_JOIN_CHANNEL", "")
 
 WEBHOOK_PATH     = "/webhook"
 WEBHOOK_FULL_URL = f"{WEBHOOK_URL}{WEBHOOK_PATH}"
@@ -406,6 +416,11 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     user_id = user.id
     args    = context.args
 
+    # ── Ban check — silently ignore banned users ──────────────────────────────
+    if is_banned(user_id):
+        logger.info("[BAN] Blocked request from banned user_id=%s", user_id)
+        return
+
     # ── Referral flow: /start ref_<referrer_id> ─────────────────────────────
     if args and args[0].startswith("ref_"):
         try:
@@ -420,7 +435,6 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                             referrer_id, user_id)
                 ref_text = (
                     "🎁 *Welcome!*\n\n"
-                    "> You joined via a referral link\n\n"
                     "✅ *24-hour free access activated!*\n\n"
                     "_You can now access all files for the next 24 hours_"
                 )
@@ -446,7 +460,6 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
         verify_text = (
             "✅ *Verification Successful!*\n\n"
-            "> You now have 24-hour access to ALL files\n\n"
             "_Sending your file now..._"
         )
         await _send_image_msg(update.message, user_id, IMG_VERIFY, verify_text, parse_mode="Markdown")
@@ -492,7 +505,32 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         # 2. Track user activity
         upsert_user(user_id, first_name=user.first_name or "")
 
-        # 3. Priority 1 — Premium user → direct access
+        # 3. Force join check
+        force_ch = FORCE_JOIN_CHANNEL or get_force_join_channel()
+        if force_ch:
+            try:
+                member = await context.bot.get_chat_member(
+                    chat_id=f"@{force_ch.lstrip('@')}",
+                    user_id=user_id,
+                )
+                if member.status in ("left", "kicked"):
+                    ch_url = f"https://t.me/{force_ch.lstrip('@')}"
+                    keyboard = InlineKeyboardMarkup([[
+                        InlineKeyboardButton("📢 Join Channel", url=ch_url),
+                        InlineKeyboardButton("✅ I Joined", url=f"https://t.me/{BOT_USERNAME}?start=file_{unique_id}"),
+                    ]])
+                    await update.message.reply_text(
+                        "📢 *Join Required*\n\n"
+                        "*You must join our channel to access files.*\n\n"
+                        "_Click Join Channel, then tap I Joined._",
+                        parse_mode="Markdown",
+                        reply_markup=keyboard,
+                    )
+                    return
+            except Exception as exc:
+                logger.warning("[FORCE_JOIN] Check failed: %s", exc)
+
+        # Priority 1 — Premium user → direct access
         if is_premium(user_id):
             logger.info("[ACCESS] Premium granted | user_id=%s | unique_id=%s", user_id, unique_id)
             await send_file_with_fallback(update, context, unique_id)
@@ -524,10 +562,9 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
         access_text = (
             "🔐 *Access Required*\n\n"
-            "> Choose how you want to access this file\n\n"
-            "✅ *Verify Now* \— Free, valid 24 hours\n"
-            + ("" if is_premium(user_id) else "💎 *Premium* \— Pay once, 30 days access\n")
-            + "🎁 *Referral* \— Friend\'s referral for free 24h"
+            "✅ *Verify Now* — Free, valid 24 hours\n"
+            + ("" if is_premium(user_id) else "💎 *Premium* — Pay once, 30 days access\n")
+            + "🎁 *Referral* — Friend\'s referral for free 24h"
         )
 
         await _send_image_msg(
@@ -553,9 +590,6 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     welcome_text = (
         f"👋 *Hey {user.first_name}!*\n\n"
         f"*File Hub Bot*\n"
-        f"> 📂 Securely store and deliver files via permanent links\n"
-        f"> 📎 Open any file link and I'll send it directly here\n"
-        f"> 🔒 Files auto-delete after 10 minutes\n\n"
         f"*What you can do:*\n"
         f"💎 /buy — Get 30-day Premium access\n"
         f"🎁 /referral — Share your referral link\n"
@@ -631,7 +665,6 @@ async def buy_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if is_premium(user.id):
         already_text = (
             "💎 *You Are Already Premium!*\n\n"
-            "> Your premium access is currently active\n\n"
             "_Enjoy unlimited access to all files for the remainder of your 30-day plan._\n\n"
             "You do not need to purchase again."
         )
@@ -640,7 +673,6 @@ async def buy_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     caption = (
         f"💎 *Get Premium Access*\n\n"
-        f"> 👤 For: {user.first_name}\n\n"
         f"💰 *Amount:* ₹{PREMIUM_AMOUNT}\n"
         f"📲 *UPI ID:* `{UPI_ID}`\n\n"
         f"📋 *Steps:*\n"
@@ -773,7 +805,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         try:
             approved_text = (
                 "🎉 *Payment Approved!*\n\n"
-                "> Your Premium access has been activated\n\n"
                 "⏳ *Valid for 30 days*\n\n"
                 "_You now have unlimited access to all files_"
             )
@@ -961,6 +992,188 @@ def file_redirect(unique_id: str) -> Response:
 
 
 
+
+# ─── Status + Help + Admin Commands ──────────────────────────────────────────
+
+async def status_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/status — Show user's current access status."""
+    user    = update.effective_user
+    user_id = user.id
+
+    if is_banned(user_id):
+        return
+
+    s = get_user_status(user_id)
+
+    premium_line = (
+        f"💎 *Premium:* ✅ Active ({s['premium_days_left']} days left)"
+        if s["premium_active"]
+        else "💎 *Premium:* ❌ Inactive"
+    )
+    verified_line = (
+        f"🔓 *24h Access:* ✅ Active ({s['verified_hours_left']}h left)"
+        if s["verified_active"]
+        else "🔓 *24h Access:* ❌ Expired"
+    )
+
+    await update.message.reply_text(
+        f"📊 *Your Status*\n\n"
+        f"👤 *Name:* {user.first_name}\n"
+        f"🆔 *ID:* `{user_id}`\n\n"
+        f"{premium_line}\n"
+        f"{verified_line}\n"
+        f"👥 *Referrals Made:* {s['referrals_made']}",
+        parse_mode="Markdown",
+    )
+
+
+async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/help — Show all available commands."""
+    user_id = update.effective_user.id
+
+    if is_banned(user_id):
+        return
+
+    admin_section = ""
+    if _is_admin(user_id):
+        admin_section = (
+            "\n\n👮 *Admin Commands*\n"
+            "/mystats — Bot statistics\n"
+            "/broadcast <msg> — Message all users\n"
+            "/ban <user_id> — Ban a user\n"
+            "/unban <user_id> — Unban a user\n"
+            "/filestats <id> — File statistics\n"
+            "/approve <user_id> — Approve payment\n"
+            "/reject <user_id> — Reject payment"
+        )
+
+    await update.message.reply_text(
+        "📖 *Available Commands*\n\n"
+        "🔹 /start — Welcome message\n"
+        "🔹 /buy — Get Premium access\n"
+        "🔹 /paid <UTR> — Submit payment\n"
+        "🔹 /referral — Get your referral link\n"
+        "🔹 /status — Check your access status\n"
+        "🔹 /help — Show this message"
+        + admin_section,
+        parse_mode="Markdown",
+    )
+
+
+async def mystats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/mystats — Admin only bot statistics."""
+    if not _is_admin(update.effective_user.id):
+        return
+
+    s = get_bot_stats()
+    await update.message.reply_text(
+        "📊 *Bot Statistics*\n\n"
+        f"👥 *Total Users:* {s['total_users']}\n"
+        f"💎 *Active Premium:* {s['total_premium']}\n"
+        f"⏳ *Pending Payments:* {s['pending_payments']}\n"
+        f"🔗 *Total Referrals:* {s['total_referrals']}\n"
+        f"📁 *Total Files:* {s['total_files']}\n"
+        f"👁 *Total Views:* {s['total_views']}",
+        parse_mode="Markdown",
+    )
+
+
+async def broadcast_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/broadcast <message> — Send message to all users."""
+    if not _is_admin(update.effective_user.id):
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "⚠️ *Usage:* `/broadcast Your message here`",
+            parse_mode="Markdown",
+        )
+        return
+
+    msg_text  = " ".join(context.args)
+    user_ids  = get_all_user_ids()
+    sent = failed = 0
+
+    status_msg = await update.message.reply_text(
+        f"📤 *Broadcasting to {len(user_ids)} users...*",
+        parse_mode="Markdown",
+    )
+
+    for uid in user_ids:
+        try:
+            await context.bot.send_message(chat_id=uid, text=msg_text)
+            sent += 1
+        except Exception:
+            failed += 1
+
+    await status_msg.edit_text(
+        f"✅ *Broadcast Complete*\n\n"
+        f"📤 *Sent:* {sent}\n"
+        f"❌ *Failed:* {failed}",
+        parse_mode="Markdown",
+    )
+    logger.info("[BROADCAST] Sent=%d Failed=%d by admin=%s", sent, failed, update.effective_user.id)
+
+
+async def ban_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/ban <user_id> — Admin only."""
+    if not _is_admin(update.effective_user.id):
+        return
+
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("⚠️ *Usage:* `/ban <user_id>`", parse_mode="Markdown")
+        return
+
+    target_id = int(context.args[0])
+    ban_user(target_id)
+    await update.message.reply_text(
+        f"🚫 *User Banned*\n\n`{target_id}` has been banned.",
+        parse_mode="Markdown",
+    )
+
+
+async def unban_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/unban <user_id> — Admin only."""
+    if not _is_admin(update.effective_user.id):
+        return
+
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("⚠️ *Usage:* `/unban <user_id>`", parse_mode="Markdown")
+        return
+
+    target_id = int(context.args[0])
+    unban_user(target_id)
+    await update.message.reply_text(
+        f"✅ *User Unbanned*\n\n`{target_id}` can now use the bot again.",
+        parse_mode="Markdown",
+    )
+
+
+async def filestats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/filestats <unique_id> — Admin only file stats."""
+    if not _is_admin(update.effective_user.id):
+        return
+
+    if not context.args:
+        await update.message.reply_text("⚠️ *Usage:* `/filestats <unique_id>`", parse_mode="Markdown")
+        return
+
+    stats = get_file_stats(context.args[0])
+    if not stats:
+        await update.message.reply_text("❌ File not found.", parse_mode="Markdown")
+        return
+
+    created = stats["created_at"].strftime("%d %b %Y") if stats["created_at"] else "Unknown"
+    await update.message.reply_text(
+        f"📁 *File Stats*\n\n"
+        f"🆔 *ID:* `{stats['unique_id']}`\n"
+        f"👁 *Views:* {stats['views']}\n"
+        f"💾 *Backups:* {stats['file_ids']}\n"
+        f"📅 *Created:* {created}",
+        parse_mode="Markdown",
+    )
+
+
 # ─── Startup ──────────────────────────────────────────────────────────────────
 
 async def register_handlers() -> None:
@@ -968,6 +1181,13 @@ async def register_handlers() -> None:
     bot_app.add_handler(CommandHandler("buy", buy_handler))
     bot_app.add_handler(CommandHandler("referral", referral_handler))
     bot_app.add_handler(CommandHandler("paid", paid_handler))
+    bot_app.add_handler(CommandHandler("status", status_handler))
+    bot_app.add_handler(CommandHandler("help", help_handler))
+    bot_app.add_handler(CommandHandler("mystats", mystats_handler))
+    bot_app.add_handler(CommandHandler("broadcast", broadcast_handler))
+    bot_app.add_handler(CommandHandler("ban", ban_handler))
+    bot_app.add_handler(CommandHandler("unban", unban_handler))
+    bot_app.add_handler(CommandHandler("filestats", filestats_handler))
     bot_app.add_handler(CallbackQueryHandler(callback_handler))
 
     file_filter = filters.Document.ALL | filters.VIDEO | filters.AUDIO
@@ -1004,6 +1224,52 @@ async def startup() -> None:
     await register_handlers()
     await set_webhook()
     logger.info("Bot is live and ready.")
+
+
+# ─── Premium Expiry Warning Thread ──────────────────────────────────────────
+
+def premium_expiry_warning_thread() -> None:
+    """Check daily and warn users whose premium expires in 3 days."""
+    import asyncio as _asyncio
+    while True:
+        time.sleep(86400)  # check every 24 hours
+        try:
+            from datetime import timedelta
+            from db import _db
+            if _db is None:
+                continue
+            now        = datetime.now(timezone.utc)
+            warn_until = now + timedelta(days=3)
+            docs = list(_db["premium_users"].find({
+                "valid_until": {"$gt": now, "$lt": warn_until}
+            }))
+            for doc in docs:
+                uid = doc.get("user_id")
+                valid_until = doc.get("valid_until")
+                if not uid or not valid_until:
+                    continue
+                if valid_until.tzinfo is None:
+                    valid_until = valid_until.replace(tzinfo=timezone.utc)
+                days_left = (valid_until - now).days
+                fut = asyncio.run_coroutine_threadsafe(
+                    bot_app.bot.send_message(
+                        chat_id=uid,
+                        text=(
+                            f"⚠️ *Premium Expiring Soon!*\n\n"
+                            f"*Your Premium access expires in {days_left} day(s).*\n\n"
+                            f"_Use /buy to renew and keep uninterrupted access._"
+                        ),
+                        parse_mode="Markdown",
+                    ),
+                    _event_loop,
+                )
+                try:
+                    fut.result(timeout=10)
+                    logger.info("[PREMIUM] Expiry warning sent to user_id=%s", uid)
+                except Exception as exc:
+                    logger.warning("[PREMIUM] Warning failed for user_id=%s: %s", uid, exc)
+        except Exception as exc:
+            logger.warning("[PREMIUM] Expiry warning thread error: %s", exc)
 
 
 # ─── Daily Cleanup Thread ────────────────────────────────────────────────────
@@ -1046,6 +1312,9 @@ def main() -> None:
 
     threading.Thread(target=daily_cleanup, daemon=True).start()
     logger.info("Daily cleanup thread started OK")
+
+    threading.Thread(target=premium_expiry_warning_thread, daemon=True).start()
+    logger.info("Premium expiry warning thread started OK")
 
     port = int(os.environ.get("PORT", 8080))
     logger.info("Starting Flask on port %d ...", port)
