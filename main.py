@@ -507,7 +507,7 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"👋 *Hey {user.first_name}!*\n\n"
         f"🤖 *File Hub Bot*\n\n"
         f"📂 I securely store and deliver files via permanent links.\n\n"
-        f"📎 Just open a file link and I will send it directly to you here.\n\n"
+        f">📎 Just open a file link and I will send it directly to you here.\n\n"
         f"💎 /buy — Get 30-day Premium access\n"
         f"🎁 /referral — Share your referral link\n\n"
         f"🔒 _Files are auto-deleted after 10 minutes for your privacy._"
