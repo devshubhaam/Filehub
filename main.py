@@ -46,6 +46,7 @@ from db import (
     reject_payment,
     reject_all_pending,
     is_premium,
+    use_referral,
 )
 from helpers import extract_unique_id, generate_link, generate_shortlink
 from dotenv import load_dotenv
@@ -79,6 +80,9 @@ ADMIN_IDS: set[int] = {
 }
 
 SHORTLINK_API    = os.environ.get("SHORTLINK_API", "")
+UPI_ID           = os.environ.get("UPI_ID", "yourname@upi")
+PREMIUM_AMOUNT   = os.environ.get("PREMIUM_AMOUNT", "49")
+UPI_QR_FILE      = os.environ.get("UPI_QR_FILE", "")
 
 WEBHOOK_PATH     = "/webhook"
 WEBHOOK_FULL_URL = f"{WEBHOOK_URL}{WEBHOOK_PATH}"
@@ -358,6 +362,35 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     user_id = user.id
     args    = context.args
 
+    # ── Referral flow: /start ref_<referrer_id> ─────────────────────────────
+    if args and args[0].startswith("ref_"):
+        try:
+            referrer_id = int(args[0][len("ref_"):])
+        except ValueError:
+            referrer_id = None
+
+        if referrer_id:
+            applied = use_referral(referrer_id, user_id)
+            if applied:
+                logger.info("[REFERRAL] New user via referral | referrer=%s | user=%s",
+                            referrer_id, user_id)
+                await update.message.reply_text(
+                    "🎁 *Welcome!*\n\n"
+                    "*You joined via a referral link.*\n\n"
+                    "✅ *24-hour free access has been activated!*\n\n"
+                    "_You can now access all files for the next 24 hours._",
+                    parse_mode="Markdown",
+                )
+            else:
+                await update.message.reply_text(
+                    "👋 *Welcome back!*\n\n"
+                    "_You have already used a referral before._",
+                    parse_mode="Markdown",
+                )
+
+        upsert_user(user_id, first_name=user.first_name or "")
+        return
+
     # ── Verification flow: /start verify_access_<unique_id> ─────────────────
     if args and args[0].startswith("verify_access_"):
         unique_id = args[0][len("verify_access_"):]
@@ -489,6 +522,62 @@ async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     await _handle_file_upload(update, context, file_id, caption, source="channel")
 
 
+
+
+# ─── Buy + Referral Handlers ──────────────────────────────────────────────────
+
+async def buy_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /buy — Show UPI payment details with QR code.
+    """
+    user = update.effective_user
+
+    caption = (
+        f"💎 *Get Premium Access*\n\n"
+        f"👤 *For:* {user.first_name}\n\n"
+        f"💰 *Amount:* ₹{PREMIUM_AMOUNT}\n"
+        f"📲 *UPI ID:* `{UPI_ID}`\n\n"
+        f"📋 *Steps:*\n"
+        f"1️⃣ Pay ₹{PREMIUM_AMOUNT} to the UPI ID above\n"
+        f"2️⃣ Note your UTR / Transaction ID\n"
+        f"3️⃣ Send `/paid <UTR>` to confirm\n\n"
+        f"⏳ *Access:* 30 days after approval\n\n"
+        f"_Example: /paid 123456789012_"
+    )
+
+    # Send QR image if configured, else send text only
+    if UPI_QR_FILE:
+        try:
+            with open(UPI_QR_FILE, "rb") as qr:
+                await update.message.reply_photo(
+                    photo=qr,
+                    caption=caption,
+                    parse_mode="Markdown",
+                )
+            return
+        except Exception as exc:
+            logger.warning("[BUY] QR file error: %s — sending text only", exc)
+
+    await update.message.reply_text(caption, parse_mode="Markdown")
+    logger.info("[BUY] /buy sent to user_id=%s", user.id)
+
+
+async def referral_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /referral — Generate and share a personal referral link.
+    """
+    user    = update.effective_user
+    ref_url = f"https://t.me/{BOT_USERNAME}?start=ref_{user.id}"
+
+    await update.message.reply_text(
+        f"🔗 *Your Referral Link*\n\n"
+        f"`{ref_url}`\n\n"
+        f"📢 *Share this link with friends!*\n\n"
+        f"✅ Every person who joins via your link gets *24-hour free access*.\n\n"
+        f"_Tap the link above to copy it._",
+        parse_mode="Markdown",
+    )
+    logger.info("[REFERRAL] Link generated for user_id=%s", user.id)
 
 # ─── Payment Handlers ─────────────────────────────────────────────────────────
 
@@ -783,6 +872,8 @@ def file_redirect(unique_id: str) -> Response:
 
 async def register_handlers() -> None:
     bot_app.add_handler(CommandHandler("start", start_handler))
+    bot_app.add_handler(CommandHandler("buy", buy_handler))
+    bot_app.add_handler(CommandHandler("referral", referral_handler))
     bot_app.add_handler(CommandHandler("paid", paid_handler))
     bot_app.add_handler(CallbackQueryHandler(callback_handler))
 
