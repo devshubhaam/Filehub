@@ -48,6 +48,7 @@ from db import (
     is_premium,
     use_referral,
     reward_referrer,
+    run_cleanup,
 )
 from helpers import extract_unique_id, generate_link, generate_shortlink
 from dotenv import load_dotenv
@@ -85,7 +86,6 @@ UPI_ID           = os.environ.get("UPI_ID", "yourname@upi")
 PREMIUM_AMOUNT   = os.environ.get("PREMIUM_AMOUNT", "49")
 UPI_QR_FILE      = os.environ.get("UPI_QR_FILE", "")
 UPI_QR_URL       = os.environ.get("UPI_QR_URL", "https://i.ibb.co/rRG680k1/Account-QRCode-AIRP-5423-DARK-THEME.png")
-Start_Img       = os.environ.get("Start_Img", "")
 
 WEBHOOK_PATH     = "/webhook"
 WEBHOOK_FULL_URL = f"{WEBHOOK_URL}{WEBHOOK_PATH}"
@@ -512,7 +512,7 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"🔒 _Files are auto-deleted after 10 minutes for your privacy._"
     )
 
-    welcome_img = Start_Img  # reuse QR URL; change UPI_QR_URL in .env for a different image
+    welcome_img = UPI_QR_URL  # reuse QR URL; change UPI_QR_URL in .env for a different image
     if welcome_img:
         try:
             await update.message.reply_photo(
@@ -956,11 +956,32 @@ async def set_webhook() -> None:
 
 async def startup() -> None:
     init_db()
+
+    # Run cleanup on startup
+    try:
+        results = run_cleanup()
+        logger.info("[CLEANUP] Startup cleanup done: %s", results)
+    except Exception as exc:
+        logger.warning("[CLEANUP] Startup cleanup failed: %s", exc)
+
     await bot_app.initialize()
     await bot_app.start()
     await register_handlers()
     await set_webhook()
     logger.info("Bot is live and ready.")
+
+
+# ─── Daily Cleanup Thread ────────────────────────────────────────────────────
+
+def daily_cleanup() -> None:
+    """Run cleanup once every 24 hours in background thread."""
+    while True:
+        time.sleep(86400)  # wait 24 hours
+        try:
+            results = run_cleanup()
+            logger.info("[CLEANUP] Daily cleanup done: %s", results)
+        except Exception as exc:
+            logger.warning("[CLEANUP] Daily cleanup failed: %s", exc)
 
 
 # ─── Keep-Alive ───────────────────────────────────────────────────────────────
@@ -987,6 +1008,9 @@ def main() -> None:
 
     threading.Thread(target=keep_alive, daemon=True).start()
     logger.info("Keep-alive thread started OK")
+
+    threading.Thread(target=daily_cleanup, daemon=True).start()
+    logger.info("Daily cleanup thread started OK")
 
     port = int(os.environ.get("PORT", 8080))
     logger.info("Starting Flask on port %d ...", port)
