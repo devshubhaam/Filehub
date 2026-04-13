@@ -439,46 +439,85 @@ def is_premium(user_id: int) -> bool:
 
 def use_referral(referrer_id: int, referred_user_id: int) -> bool:
     """
-    Record a referral and give the new user 24-hour verified access.
+    Track a referral when User 2 joins via User 1's link.
 
     Rules:
-      - A user can only be referred once (first join counts)
-      - Referrer cannot refer themselves
+      - A user can only be referred once
+      - No self-referral allowed
 
-    Returns True if referral was applied, False if already used or self-referral.
+    NOTE: This only records the referral.
+    Reward (24h access) is given to User 1 ONLY AFTER User 2
+    completes shortlink verification — see reward_referrer().
+
+    Returns True if recorded, False if duplicate or self-referral.
     """
     if _db is None:
         raise RuntimeError("Database not initialised — call init_db() first.")
 
-    # Prevent self-referral
     if referrer_id == referred_user_id:
         logger.warning("[REFERRAL] Self-referral blocked | user_id=%s", referrer_id)
         return False
 
-    # Check if user was already referred
     existing = _db["referrals"].find_one({"referred_user": referred_user_id})
     if existing:
-        logger.info("[REFERRAL] Already referred | referred_user=%s", referred_user_id)
+        logger.info("[REFERRAL] Already tracked | referred_user=%s", referred_user_id)
         return False
 
     now = datetime.now(tz=timezone.utc)
-
-    # Store referral record
     _db["referrals"].insert_one({
         "referrer_id":   referrer_id,
         "referred_user": referred_user_id,
+        "rewarded":      False,       # reward pending until User 2 verifies
         "timestamp":     now,
     })
 
-    # Give referred user 24-hour verified access (reuse verified_users collection)
-    _db["verified_users"].update_one(
-        {"user_id": referred_user_id},
-        {"$set": {"user_id": referred_user_id, "verified_at": now}},
-        upsert=True,
-    )
-
     logger.info(
-        "[REFERRAL] Applied | referrer_id=%s → referred_user=%s | 24h access granted",
+        "[REFERRAL] Tracked | referrer=%s → referred=%s | reward pending",
         referrer_id, referred_user_id,
     )
     return True
+
+
+def reward_referrer(verified_user_id: int) -> int | None:
+    """
+    Called when a user completes shortlink verification.
+
+    If this user was referred by someone:
+      - Give that referrer 24-hour verified access (reward)
+      - Mark referral as rewarded so it only fires once
+
+    Returns referrer_id if reward was given, None otherwise.
+    """
+    if _db is None:
+        raise RuntimeError("Database not initialised — call init_db() first.")
+
+    # Find pending referral for this user
+    doc = _db["referrals"].find_one({
+        "referred_user": verified_user_id,
+        "rewarded": False,
+    })
+
+    if not doc:
+        return None
+
+    referrer_id = doc["referrer_id"]
+    now         = datetime.now(tz=timezone.utc)
+
+    # Give referrer 24-hour access
+    _db["verified_users"].update_one(
+        {"user_id": referrer_id},
+        {"$set": {"user_id": referrer_id, "verified_at": now}},
+        upsert=True,
+    )
+
+    # Mark referral as rewarded (prevent double reward)
+    _db["referrals"].update_one(
+        {"_id": doc["_id"]},
+        {"$set": {"rewarded": True, "rewarded_at": now}},
+    )
+
+    logger.info(
+        "[REFERRAL] Referrer rewarded | referrer=%s ← referred=%s | 24h access granted",
+        referrer_id, verified_user_id,
+    )
+    return referrer_id
