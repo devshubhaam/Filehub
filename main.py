@@ -83,6 +83,7 @@ SHORTLINK_API    = os.environ.get("SHORTLINK_API", "")
 UPI_ID           = os.environ.get("UPI_ID", "yourname@upi")
 PREMIUM_AMOUNT   = os.environ.get("PREMIUM_AMOUNT", "49")
 UPI_QR_FILE      = os.environ.get("UPI_QR_FILE", "")
+UPI_QR_URL       = os.environ.get("UPI_QR_URL", "https://i.ibb.co/rRG680k1/Account-QRCode-AIRP-5423-DARK-THEME.png")
 
 WEBHOOK_PATH     = "/webhook"
 WEBHOOK_FULL_URL = f"{WEBHOOK_URL}{WEBHOOK_PATH}"
@@ -447,28 +448,62 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         short_url  = generate_shortlink(verify_url)
         logger.info("[ACCESS] Shortlink generated | user_id=%s | short=%s", user_id, short_url)
 
-        keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ Verify Now", url=short_url)
-        ]])
+        buy_url = f"https://t.me/{BOT_USERNAME}?start=buy"
+        ref_url = f"https://t.me/{BOT_USERNAME}?start=referral"
+
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Verify Now (Free)", url=short_url)],
+            [InlineKeyboardButton("💎 Get Premium Access", url=buy_url)],
+            [InlineKeyboardButton("🎁 Use Referral (Free 24h)", url=ref_url)],
+        ])
         await update.message.reply_text(
             "🔐 *Access Required*\n\n"
-            "*Verify once to unlock all files for 24 hours.*\n\n"
-            "_Click the button below to complete verification._",
+            "*Choose an option to access this file:*\n\n"
+            "✅ *Verify Now* — Free, valid 24 hours\n"
+            "💎 *Premium* — Pay once, access for 30 days\n"
+            "🎁 *Referral* — Get a friend\'s referral for free 24h access",
             parse_mode="Markdown",
             reply_markup=keyboard,
         )
         return
 
+    # ── Deep-link: /start buy → show /buy ───────────────────────────────────
+    if args and args[0] == "buy":
+        await buy_handler(update, context)
+        return
+
+    # ── Deep-link: /start referral → show /referral ───────────────────────────
+    if args and args[0] == "referral":
+        await referral_handler(update, context)
+        return
+
     # ── Plain /start ──────────────────────────────────────────────────────────
     upsert_user(user_id, first_name=user.first_name or "")
-    await update.message.reply_text(
+
+    welcome_text = (
         f"👋 *Hey {user.first_name}!*\n\n"
         f"🤖 *File Hub Bot*\n\n"
         f"📂 I securely store and deliver files via permanent links.\n\n"
         f"📎 Just open a file link and I will send it directly to you here.\n\n"
-        f"🔒 _Files are auto-deleted after 10 minutes for your privacy._",
-        parse_mode="Markdown",
+        f"💎 /buy — Get 30-day Premium access\n"
+        f"🎁 /referral — Share your referral link\n\n"
+        f"🔒 _Files are auto-deleted after 10 minutes for your privacy._"
     )
+
+    welcome_img = UPI_QR_URL  # reuse QR URL; change UPI_QR_URL in .env for a different image
+    if welcome_img:
+        try:
+            await update.message.reply_photo(
+                photo=welcome_img,
+                caption=welcome_text,
+                parse_mode="Markdown",
+            )
+            logger.info("[USER] /start with image from user_id=%s", user_id)
+            return
+        except Exception as exc:
+            logger.warning("[USER] Welcome image failed: %s — sending text only", exc)
+
+    await update.message.reply_text(welcome_text, parse_mode="Markdown")
     logger.info("[USER] /start from user_id=%s", user_id)
 
 
@@ -545,18 +580,19 @@ async def buy_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         f"_Example: /paid 123456789012_"
     )
 
-    # Send QR image if configured, else send text only
-    if UPI_QR_FILE:
+    # Send QR via URL (fastest, no file needed)
+    qr_url = UPI_QR_URL or UPI_QR_FILE
+    if qr_url:
         try:
-            with open(UPI_QR_FILE, "rb") as qr:
-                await update.message.reply_photo(
-                    photo=qr,
-                    caption=caption,
-                    parse_mode="Markdown",
-                )
+            await update.message.reply_photo(
+                photo=qr_url,
+                caption=caption,
+                parse_mode="Markdown",
+            )
+            logger.info("[BUY] /buy with QR sent to user_id=%s", user.id)
             return
         except Exception as exc:
-            logger.warning("[BUY] QR file error: %s — sending text only", exc)
+            logger.warning("[BUY] QR send error: %s — sending text only", exc)
 
     await update.message.reply_text(caption, parse_mode="Markdown")
     logger.info("[BUY] /buy sent to user_id=%s", user.id)
