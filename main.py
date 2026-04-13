@@ -47,6 +47,7 @@ from db import (
     reject_all_pending,
     is_premium,
     use_referral,
+    reward_referrer,
 )
 from helpers import extract_unique_id, generate_link, generate_shortlink
 from dotenv import load_dotenv
@@ -396,6 +397,7 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if args and args[0].startswith("verify_access_"):
         unique_id = args[0][len("verify_access_"):]
 
+        # Give User 2 (this user) their 24h access
         verify_user(user_id)
         upsert_user(user_id, first_name=user.first_name or "")
         logger.info("[ACCESS] Verification complete | user_id=%s", user_id)
@@ -407,7 +409,26 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             parse_mode="Markdown",
         )
 
-        # Immediately deliver the file they originally requested
+        # Check if User 2 was referred — if so reward User 1 (referrer)
+        referrer_id = reward_referrer(user_id)
+        if referrer_id:
+            logger.info("[REFERRAL] Rewarding referrer=%s after user=%s verified",
+                        referrer_id, user_id)
+            try:
+                await context.bot.send_message(
+                    chat_id=referrer_id,
+                    text=(
+                        "🎉 *Referral Reward!*\n\n"
+                        "Someone you referred just verified their account.\n\n"
+                        "✅ *You have been granted 24-hour free access!*\n\n"
+                        "_Enjoy unlimited file access for the next 24 hours._"
+                    ),
+                    parse_mode="Markdown",
+                )
+            except Exception as exc:
+                logger.warning("[REFERRAL] Could not notify referrer=%s: %s", referrer_id, exc)
+
+        # Deliver the file
         logger.info("[DELIVERY] Post-verify delivery | unique_id=%s | user_id=%s", unique_id, user_id)
         await send_file_with_fallback(update, context, unique_id)
         return
