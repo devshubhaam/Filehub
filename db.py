@@ -578,3 +578,146 @@ def run_cleanup() -> dict:
     total = sum(results.values())
     logger.info("[CLEANUP] Done — total %d documents removed | breakdown: %s", total, results)
     return results
+
+# ─── Admin Stats API ──────────────────────────────────────────────────────────
+
+def get_bot_stats() -> dict:
+    """Return key stats for admin /mystats command."""
+    if _db is None:
+        raise RuntimeError("Database not initialised — call init_db() first.")
+
+    from datetime import timedelta
+    now = datetime.now(tz=timezone.utc)
+
+    total_users     = _db["users"].count_documents({})
+    total_premium   = _db["premium_users"].count_documents(
+        {"valid_until": {"$gt": now}}
+    )
+    pending_payments = _db["payments"].count_documents({"status": "pending"})
+    total_referrals  = _db["referrals"].count_documents({})
+    total_files      = _db["files"].count_documents({"unique_id": {"$exists": True}})
+    total_views      = sum(
+        d.get("views", 0)
+        for d in _db["files"].find({"unique_id": {"$exists": True}}, {"views": 1})
+    )
+
+    return {
+        "total_users":      total_users,
+        "total_premium":    total_premium,
+        "pending_payments": pending_payments,
+        "total_referrals":  total_referrals,
+        "total_files":      total_files,
+        "total_views":      total_views,
+    }
+
+
+def get_file_stats(unique_id: str) -> dict | None:
+    """Return stats for a specific file."""
+    if _db is None:
+        raise RuntimeError("Database not initialised — call init_db() first.")
+
+    doc = _db["files"].find_one({"unique_id": unique_id})
+    if not doc:
+        return None
+    return {
+        "unique_id":   unique_id,
+        "views":       doc.get("views", 0),
+        "file_ids":    len(doc.get("file_ids", [])),
+        "created_at":  doc.get("created_at"),
+        "updated_at":  doc.get("updated_at"),
+    }
+
+
+def get_user_status(user_id: int) -> dict:
+    """Return full status for a user — premium, verified, referrals."""
+    if _db is None:
+        raise RuntimeError("Database not initialised — call init_db() first.")
+
+    from datetime import timedelta
+    now = datetime.now(tz=timezone.utc)
+
+    # Premium
+    premium_doc   = _db["premium_users"].find_one({"user_id": user_id})
+    premium_active = False
+    premium_days_left = 0
+    if premium_doc:
+        valid_until = premium_doc.get("valid_until")
+        if valid_until:
+            if valid_until.tzinfo is None:
+                valid_until = valid_until.replace(tzinfo=timezone.utc)
+            if valid_until > now:
+                premium_active    = True
+                premium_days_left = (valid_until - now).days
+
+    # 24h verified
+    verified_doc = _db["verified_users"].find_one({"user_id": user_id})
+    verified_active = False
+    verified_hours_left = 0
+    if verified_doc:
+        verified_at = verified_doc.get("verified_at")
+        if verified_at:
+            if verified_at.tzinfo is None:
+                verified_at = verified_at.replace(tzinfo=timezone.utc)
+            elapsed = (now - verified_at).total_seconds() / 3600
+            if elapsed < 24:
+                verified_active     = True
+                verified_hours_left = int(24 - elapsed)
+
+    # Referrals made
+    referrals_made = _db["referrals"].count_documents({"referrer_id": user_id})
+
+    return {
+        "premium_active":     premium_active,
+        "premium_days_left":  premium_days_left,
+        "verified_active":    verified_active,
+        "verified_hours_left": verified_hours_left,
+        "referrals_made":     referrals_made,
+    }
+
+
+# ─── Ban System ───────────────────────────────────────────────────────────────
+
+def ban_user(user_id: int) -> None:
+    """Add user to banned_users collection."""
+    if _db is None:
+        raise RuntimeError("Database not initialised — call init_db() first.")
+    _db["banned_users"].update_one(
+        {"user_id": user_id},
+        {"$set": {"user_id": user_id, "banned_at": datetime.now(tz=timezone.utc)}},
+        upsert=True,
+    )
+    logger.info("[BAN] Banned user_id=%s", user_id)
+
+
+def unban_user(user_id: int) -> None:
+    """Remove user from banned_users collection."""
+    if _db is None:
+        raise RuntimeError("Database not initialised — call init_db() first.")
+    _db["banned_users"].delete_one({"user_id": user_id})
+    logger.info("[BAN] Unbanned user_id=%s", user_id)
+
+
+def is_banned(user_id: int) -> bool:
+    """Return True if user is banned."""
+    if _db is None:
+        raise RuntimeError("Database not initialised — call init_db() first.")
+    return _db["banned_users"].find_one({"user_id": user_id}) is not None
+
+
+# ─── Force Join ───────────────────────────────────────────────────────────────
+
+def get_force_join_channel() -> str:
+    """Return force-join channel username from DB config."""
+    if _db is None:
+        return ""
+    doc = _db["config"].find_one({"key": "force_join_channel"})
+    return doc.get("value", "") if doc else ""
+
+
+# ─── Broadcast ────────────────────────────────────────────────────────────────
+
+def get_all_user_ids() -> list[int]:
+    """Return all user IDs for broadcast."""
+    if _db is None:
+        raise RuntimeError("Database not initialised — call init_db() first.")
+    return [d["user_id"] for d in _db["users"].find({}, {"user_id": 1})]
