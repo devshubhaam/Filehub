@@ -521,3 +521,60 @@ def reward_referrer(verified_user_id: int) -> int | None:
         referrer_id, verified_user_id,
     )
     return referrer_id
+
+# ─── Database Cleanup ─────────────────────────────────────────────────────────
+
+def run_cleanup() -> dict:
+    """
+    Safe database cleanup — runs on bot startup.
+
+    Deletes ONLY data that:
+      1. Is expired / no longer useful
+      2. Cannot cause any abuse if removed
+
+    NEVER deletes:
+      - referrals       (fraud prevention)
+      - users           (tracking history)
+      - premium_users   (paid access records)
+      - files           (actual file data)
+      - payments with status=pending (active reviews)
+
+    Returns dict with count of deleted documents per collection.
+    """
+    if _db is None:
+        raise RuntimeError("Database not initialised — call init_db() first.")
+
+    from datetime import timedelta
+    now     = datetime.now(tz=timezone.utc)
+    results = {}
+
+    # 1. verified_users — delete expired (> 25 hours old, extra 1h buffer)
+    cutoff_24h = now - timedelta(hours=25)
+    r = _db["verified_users"].delete_many({"verified_at": {"$lt": cutoff_24h}})
+    results["verified_users"] = r.deleted_count
+    logger.info("[CLEANUP] verified_users: deleted %d expired records", r.deleted_count)
+
+    # 2. clicks — delete older than 7 days
+    cutoff_7d = now - timedelta(days=7)
+    r = _db["clicks"].delete_many({"timestamp": {"$lt": cutoff_7d}})
+    results["clicks"] = r.deleted_count
+    logger.info("[CLEANUP] clicks: deleted %d old records", r.deleted_count)
+
+    # 3. files — delete smoke-test docs (no unique_id field)
+    r = _db["files"].delete_many({"test": "ok"})
+    results["files_test"] = r.deleted_count
+    logger.info("[CLEANUP] files: deleted %d smoke-test docs", r.deleted_count)
+
+    # 4. payments — delete approved/rejected older than 90 days
+    #    KEEP: pending (active), and all recent records for UTR duplicate check
+    cutoff_90d = now - timedelta(days=90)
+    r = _db["payments"].delete_many({
+        "status":    {"$in": ["approved", "rejected"]},
+        "timestamp": {"$lt": cutoff_90d},
+    })
+    results["payments"] = r.deleted_count
+    logger.info("[CLEANUP] payments: deleted %d old approved/rejected records", r.deleted_count)
+
+    total = sum(results.values())
+    logger.info("[CLEANUP] Done — total %d documents removed | breakdown: %s", total, results)
+    return results
