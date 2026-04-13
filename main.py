@@ -81,6 +81,7 @@ ADMIN_IDS: set[int] = {
     if uid.strip().isdigit()
 }
 
+START_IMG    = os.environ.get("START_IMG", "")
 SHORTLINK_API    = os.environ.get("SHORTLINK_API", "")
 UPI_ID           = os.environ.get("UPI_ID", "yourname@upi")
 PREMIUM_AMOUNT   = os.environ.get("PREMIUM_AMOUNT", "49")
@@ -512,7 +513,7 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"🔒 _Files are auto-deleted after 10 minutes for your privacy._"
     )
 
-    welcome_img = UPI_QR_URL  # reuse QR URL; change UPI_QR_URL in .env for a different image
+    welcome_img = START_IMG  # reuse QR URL; change UPI_QR_URL in .env for a different image
     if welcome_img:
         try:
             await update.message.reply_photo(
