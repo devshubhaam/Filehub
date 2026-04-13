@@ -81,7 +81,6 @@ ADMIN_IDS: set[int] = {
     if uid.strip().isdigit()
 }
 
-START_IMG    = os.environ.get("START_IMG", "")
 SHORTLINK_API    = os.environ.get("SHORTLINK_API", "")
 UPI_ID           = os.environ.get("UPI_ID", "yourname@upi")
 PREMIUM_AMOUNT   = os.environ.get("PREMIUM_AMOUNT", "49")
@@ -378,13 +377,23 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             if applied:
                 logger.info("[REFERRAL] New user via referral | referrer=%s | user=%s",
                             referrer_id, user_id)
-                await update.message.reply_text(
+                ref_text = (
                     "🎁 *Welcome!*\n\n"
                     "*You joined via a referral link.*\n\n"
                     "✅ *24-hour free access has been activated!*\n\n"
-                    "_You can now access all files for the next 24 hours._",
-                    parse_mode="Markdown",
+                    "_You can now access all files for the next 24 hours._"
                 )
+                if UPI_QR_URL:
+                    try:
+                        await update.message.reply_photo(
+                            photo=UPI_QR_URL,
+                            caption=ref_text,
+                            parse_mode="Markdown",
+                        )
+                    except Exception:
+                        await update.message.reply_text(ref_text, parse_mode="Markdown")
+                else:
+                    await update.message.reply_text(ref_text, parse_mode="Markdown")
             else:
                 await update.message.reply_text(
                     "👋 *Welcome back!*\n\n"
@@ -404,12 +413,22 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         upsert_user(user_id, first_name=user.first_name or "")
         logger.info("[ACCESS] Verification complete | user_id=%s", user_id)
 
-        await update.message.reply_text(
+        verify_text = (
             "✅ *Verification Successful!*\n\n"
             "*You now have 24-hour access to ALL files.*\n\n"
-            "_Sending your file now..._",
-            parse_mode="Markdown",
+            "_Sending your file now..._"
         )
+        if UPI_QR_URL:
+            try:
+                await update.message.reply_photo(
+                    photo=UPI_QR_URL,
+                    caption=verify_text,
+                    parse_mode="Markdown",
+                )
+            except Exception:
+                await update.message.reply_text(verify_text, parse_mode="Markdown")
+        else:
+            await update.message.reply_text(verify_text, parse_mode="Markdown")
 
         # Check if User 2 was referred — if so reward User 1 (referrer)
         referrer_id = reward_referrer(user_id)
@@ -474,20 +493,34 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         buy_url = f"https://t.me/{BOT_USERNAME}?start=buy"
         ref_url = f"https://t.me/{BOT_USERNAME}?start=referral"
 
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Verify Now (Free)", url=short_url)],
-            [InlineKeyboardButton("💎 Get Premium Access", url=buy_url)],
-            [InlineKeyboardButton("🎁 Use Referral (Free 24h)", url=ref_url)],
-        ])
-        await update.message.reply_text(
+        # Only show Buy button if user is NOT already premium
+        buttons = [[InlineKeyboardButton("✅ Verify Now (Free)", url=short_url)]]
+        if not is_premium(user_id):
+            buttons.append([InlineKeyboardButton("💎 Get Premium Access", url=buy_url)])
+        buttons.append([InlineKeyboardButton("🎁 Use Referral (Free 24h)", url=ref_url)])
+
+        keyboard = InlineKeyboardMarkup(buttons)
+
+        access_text = (
             "🔐 *Access Required*\n\n"
             "*Choose an option to access this file:*\n\n"
             "✅ *Verify Now* — Free, valid 24 hours\n"
-            "💎 *Premium* — Pay once, access for 30 days\n"
-            "🎁 *Referral* — Get a friend\'s referral for free 24h access",
-            parse_mode="Markdown",
-            reply_markup=keyboard,
+            + ("" if is_premium(user_id) else "💎 *Premium* — Pay once, access for 30 days\n")
+            + "🎁 *Referral* — Get a friend\'s referral for free 24h access"
         )
+
+        if UPI_QR_URL:
+            try:
+                await update.message.reply_photo(
+                    photo=UPI_QR_URL,
+                    caption=access_text,
+                    parse_mode="Markdown",
+                    reply_markup=keyboard,
+                )
+                return
+            except Exception:
+                pass
+        await update.message.reply_text(access_text, parse_mode="Markdown", reply_markup=keyboard)
         return
 
     # ── Deep-link: /start buy → show /buy ───────────────────────────────────
@@ -513,7 +546,7 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"🔒 _Files are auto-deleted after 10 minutes for your privacy._"
     )
 
-    welcome_img = START_IMG  # reuse QR URL; change UPI_QR_URL in .env for a different image
+    welcome_img = UPI_QR_URL  # reuse QR URL; change UPI_QR_URL in .env for a different image
     if welcome_img:
         try:
             await update.message.reply_photo(
@@ -737,16 +770,32 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
         # Notify user
         try:
-            await context.bot.send_message(
-                chat_id=user_id,
-                text=(
-                    "🎉 *Payment Approved!*\n\n"
-                    "*Your Premium access has been activated.*\n\n"
-                    "⏳ *Valid for 30 days.*\n\n"
-                    "_You now have unlimited access to all files._"
-                ),
-                parse_mode="Markdown",
+            approved_text = (
+                "🎉 *Payment Approved!*\n\n"
+                "*Your Premium access has been activated.*\n\n"
+                "⏳ *Valid for 30 days.*\n\n"
+                "_You now have unlimited access to all files._"
             )
+            if UPI_QR_URL:
+                try:
+                    await context.bot.send_photo(
+                        chat_id=user_id,
+                        photo=UPI_QR_URL,
+                        caption=approved_text,
+                        parse_mode="Markdown",
+                    )
+                except Exception:
+                    await context.bot.send_message(
+                        chat_id=user_id,
+                        text=approved_text,
+                        parse_mode="Markdown",
+                    )
+            else:
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=approved_text,
+                    parse_mode="Markdown",
+                )
         except Exception as exc:
             logger.warning("[PAYMENT] Could not notify user_id=%s: %s", user_id, exc)
 
