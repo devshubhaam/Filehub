@@ -57,6 +57,17 @@ from db import (
     is_banned,
     get_force_join_channel,
     get_all_user_ids,
+    PREMIUM_PLANS,
+    submit_payment_plan,
+    approve_payment_plan,
+    use_free_trial,
+    check_referral_milestone,
+    use_viral_share,
+    get_referral_stats,
+    cancel_payment,
+    get_top_files,
+    get_daily_report,
+    extend_premium,
 )
 from helpers import extract_unique_id, generate_link, generate_shortlink
 from dotenv import load_dotenv
@@ -91,7 +102,10 @@ ADMIN_IDS: set[int] = {
 
 SHORTLINK_API    = os.environ.get("SHORTLINK_API", "")
 UPI_ID           = os.environ.get("UPI_ID", "yourname@upi")
-PREMIUM_AMOUNT   = os.environ.get("PREMIUM_AMOUNT", "49")
+PREMIUM_AMOUNT   = os.environ.get("PREMIUM_AMOUNT", "49")  # legacy
+PLAN_7_AMOUNT    = os.environ.get("PLAN_7_AMOUNT",  "19")
+PLAN_30_AMOUNT   = os.environ.get("PLAN_30_AMOUNT", "49")
+PLAN_90_AMOUNT   = os.environ.get("PLAN_90_AMOUNT", "99")
 UPI_QR_FILE      = os.environ.get("UPI_QR_FILE", "")
 
 # ── Separate image URL for each message type ──────────────────────────────────
@@ -112,33 +126,36 @@ WEBHOOK_FULL_URL = f"{WEBHOOK_URL}{WEBHOOK_PATH}"
 # In-memory store: { user_id: [timestamp, timestamp, ...] }
 _user_requests: dict[int, list[float]] = defaultdict(list)
 
-RATE_LIMIT_MAX    = 5    # max requests
+RATE_LIMIT_MAX    = 5    # max requests before warning
 RATE_LIMIT_WINDOW = 60   # per N seconds
+RATE_LIMIT_BAN    = 20   # auto temp-ban threshold per minute
 
 
 def _is_rate_limited(user_id: int) -> bool:
     """
-    Return True if user has exceeded RATE_LIMIT_MAX requests
-    within the last RATE_LIMIT_WINDOW seconds.
-
-    Automatically cleans up old timestamps on every call.
+    Rate limit + auto temp-ban on flood.
+    - >5 req/min  → warning
+    - >20 req/min → auto ban for 1 hour
     """
     now    = time.time()
     window = now - RATE_LIMIT_WINDOW
 
-    # Keep only timestamps within the current window
     _user_requests[user_id] = [
         ts for ts in _user_requests[user_id] if ts > window
     ]
 
-    if len(_user_requests[user_id]) >= RATE_LIMIT_MAX:
-        logger.warning(
-            "[RATE-LIMIT] user_id=%s exceeded %d req/%ds",
-            user_id, RATE_LIMIT_MAX, RATE_LIMIT_WINDOW,
-        )
+    count = len(_user_requests[user_id])
+
+    # Auto temp-ban on flood
+    if count >= RATE_LIMIT_BAN:
+        ban_user(user_id)
+        logger.warning("[FLOOD] Auto-banned user_id=%s | %d req/min", user_id, count)
         return True
 
-    # Record this request
+    if count >= RATE_LIMIT_MAX:
+        logger.warning("[RATE-LIMIT] user_id=%s exceeded %d req/%ds", user_id, RATE_LIMIT_MAX, RATE_LIMIT_WINDOW)
+        return True
+
     _user_requests[user_id].append(now)
     return False
 
@@ -413,15 +430,21 @@ async def send_file_with_fallback(
     # 3. Increment views
     increment_views(unique_id)
 
-    # 4. Send auto-delete notice
+    # 4. Send auto-delete notice with share button
+    share_url  = f"{WEBHOOK_URL}/file/{unique_id}"
+    share_btn  = f"https://t.me/{BOT_USERNAME}?start=file_{unique_id}"
     notice_msg = await context.bot.send_message(
         chat_id=chat_id,
         text=(
             f"⏳ *Auto-Delete Active*\n\n"
             f"*{total_sent} file(s) will be deleted in 10 minutes.*\n\n"
-            "_Save them now before the timer runs out!_"
+            "_Save them now before the timer runs out!_\n\n"
+            "🔗 *Share & earn 24h free access:*"
         ),
         parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔗 Share & Get 24h Free", url=f"https://t.me/share/url?url={share_btn}&text=Get+this+file+for+free!")
+        ]])
     )
     sent_message_ids.append(notice_msg.message_id)
 
@@ -522,6 +545,22 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 )
             except Exception as exc:
                 logger.warning("[REFERRAL] Could not notify referrer=%s: %s", referrer_id, exc)
+
+            # Check milestone reward
+            milestone_days = check_referral_milestone(referrer_id)
+            if milestone_days:
+                try:
+                    await context.bot.send_message(
+                        chat_id=referrer_id,
+                        text=(
+                            f"🏆 *Referral Milestone Reached!*\n\n"
+                            f"*You have earned {milestone_days} days of FREE Premium!*\n\n"
+                            "_Keep referring to unlock the next milestone!_"
+                        ),
+                        parse_mode="Markdown",
+                    )
+                except Exception:
+                    pass
 
         # Deliver the file
         logger.info("[DELIVERY] Post-verify delivery | unique_id=%s | user_id=%s", unique_id, user_id)
@@ -700,35 +739,51 @@ async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def buy_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    /buy — Show UPI payment details with QR code.
-    If already premium → show premium status instead.
+    /buy — Show multi-plan premium options.
+    Already premium → show status + extend option.
     """
-    user = update.effective_user
+    user    = update.effective_user
+    user_id = user.id
 
-    # Already premium — no need to buy again
-    if is_premium(user.id):
+    if is_premium(user_id):
+        s = get_user_status(user_id)
         already_text = (
             "💎 *You Are Already Premium!*\n\n"
-            "_Enjoy unlimited access to all files for the remainder of your 30-day plan._\n\n"
-            "You do not need to purchase again."
+            f"⏳ *{s['premium_days_left']} days remaining*\n\n"
+            "_Want to extend? Pay and submit UTR — your days will be added to current plan._\n\n"
+            f"📲 *UPI ID:* `{UPI_ID}`"
         )
-        await _send_image_msg(update.message, user.id, IMG_PREMIUM, already_text, parse_mode="Markdown")
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"⚡ Extend 7 Days — ₹{PLAN_7_AMOUNT}",  callback_data="buy_plan_7")],
+            [InlineKeyboardButton(f"💎 Extend 30 Days — ₹{PLAN_30_AMOUNT}", callback_data="buy_plan_30")],
+            [InlineKeyboardButton(f"👑 Extend 90 Days — ₹{PLAN_90_AMOUNT}", callback_data="buy_plan_90")],
+        ])
+        await _send_image_msg(update.message, user_id, IMG_PREMIUM, already_text,
+                              parse_mode="Markdown", reply_markup=keyboard)
         return
 
     caption = (
         f"💎 *Get Premium Access*\n\n"
-        f"💰 *Amount:* ₹{PREMIUM_AMOUNT}\n"
         f"📲 *UPI ID:* `{UPI_ID}`\n\n"
+        f"Choose your plan:\n"
+        f"⚡ *7 Days* — ₹{PLAN_7_AMOUNT}\n"
+        f"💎 *30 Days* — ₹{PLAN_30_AMOUNT}\n"
+        f"👑 *90 Days* — ₹{PLAN_90_AMOUNT}\n\n"
         f"📋 *Steps:*\n"
-        f"1️⃣ Pay ₹{PREMIUM_AMOUNT} to the UPI ID above\n"
-        f"2️⃣ Note your UTR / Transaction ID\n"
-        f"3️⃣ Send /paid <UTR> to confirm\n\n"
-        f"⏳ *Access:* 30 days after approval\n\n"
-        f"_Example: /paid 123456789012_"
+        f"1️⃣ Choose plan, pay UPI\n"
+        f"2️⃣ Note UTR / Transaction ID\n"
+        f"3️⃣ Send: /paid <UTR> <plan>\n\n"
+        f"_Example: /paid 123456789012 30_\n"
+        f"_(Default plan: 30 days if not specified)_"
     )
-
-    await _send_image_msg(update.message, user.id, UPI_QR_URL or UPI_QR_FILE, caption)
-    logger.info("[BUY] /buy sent to user_id=%s", user.id)
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"⚡ 7 Days — ₹{PLAN_7_AMOUNT}",  callback_data="buy_plan_7")],
+        [InlineKeyboardButton(f"💎 30 Days — ₹{PLAN_30_AMOUNT}", callback_data="buy_plan_30")],
+        [InlineKeyboardButton(f"👑 90 Days — ₹{PLAN_90_AMOUNT}", callback_data="buy_plan_90")],
+    ])
+    await _send_image_msg(update.message, user_id, IMG_PREMIUM, caption,
+                          parse_mode="Markdown", reply_markup=keyboard)
+    logger.info("[BUY] /buy sent to user_id=%s", user_id)
 
 
 async def referral_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -767,7 +822,10 @@ async def paid_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     utr    = context.args[0].strip()
-    result = submit_payment(user_id, utr)
+    plan   = context.args[1].strip() if len(context.args) > 1 else "30"
+    if plan not in ("7", "30", "90"):
+        plan = "30"
+    result = submit_payment_plan(user_id, utr, plan)
 
     if result == "duplicate":
         await update.message.reply_text(
@@ -841,9 +899,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         user_id = int(parts[1])
         utr     = parts[2]
 
-        approve_payment(user_id, utr)
-        logger.info("[PAYMENT] Approved by admin=%s | user_id=%s | utr=%s",
-                    admin.id, user_id, utr)
+        days = approve_payment_plan(user_id, utr)
+        logger.info("[PAYMENT] Approved %d days by admin=%s | user_id=%s | utr=%s",
+                    days, admin.id, user_id, utr)
 
         # Notify user
         try:
@@ -899,6 +957,15 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             f"🔢 UTR: `{utr}`\n"
             f"👮 Rejected by: {admin.first_name}",
             parse_mode="Markdown",
+        )
+
+    # ── Buy Plan Info (show UPI for chosen plan) ─────────────────────────────
+    elif data.startswith("buy_plan_"):
+        plan = data.replace("buy_plan_", "")
+        plan_info = PREMIUM_PLANS.get(plan, PREMIUM_PLANS["30"])
+        await query.answer(
+            f"Pay ₹{plan_info['amount']} to {UPI_ID}\nThen send: /paid <UTR> {plan}",
+            show_alert=True,
         )
 
     # ── Reject All ────────────────────────────────────────────────────────────
@@ -1095,8 +1162,12 @@ async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "📖 *Available Commands*\n\n"
         "🔹 /start — Welcome message\n"
         "🔹 /buy — Get Premium access\n"
-        "🔹 /paid <UTR> — Submit payment\n"
+        "🔹 /paid <UTR> <plan> — Submit payment\n"
         "🔹 /referral — Get your referral link\n"
+        "🔹 /myreferrals — Your referral stats\n"
+        "🔹 /trial — 2-hour free trial (once)\n"
+        "🔹 /share <id> — Share file, get 24h free\n"
+        "🔹 /cancel — Cancel pending payment\n"
         "🔹 /status — Check your access status\n"
         "🔹 /help — Show this message"
         + admin_section,
@@ -1218,6 +1289,173 @@ async def filestats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     )
 
 
+
+# ─── New Feature Handlers ─────────────────────────────────────────────────────
+
+async def trial_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/trial — 2-hour free access, one time only."""
+    user_id = update.effective_user.id
+    if is_banned(user_id):
+        return
+
+    applied = use_free_trial(user_id)
+    if applied:
+        await update.message.reply_text(
+            "🎁 *Free Trial Activated!*\n\n"
+            "*You have 2 hours of free access.*\n\n"
+            "_Open any file link to access it now._\n\n"
+            "💎 _Enjoying it? Use /buy to get full premium access!_",
+            parse_mode="Markdown",
+        )
+        logger.info("[TRIAL] Trial used by user_id=%s", user_id)
+    else:
+        await update.message.reply_text(
+            "⚠️ *Trial Already Used*\n\n"
+            "_You have already used your free trial._\n\n"
+            "💎 Use /buy to get Premium access.",
+            parse_mode="Markdown",
+        )
+
+
+async def myreferrals_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/myreferrals — Show referral stats."""
+    user_id = update.effective_user.id
+    if is_banned(user_id):
+        return
+
+    s       = get_referral_stats(user_id)
+    ref_url = f"https://t.me/{BOT_USERNAME}?start=ref_{user_id}"
+
+    next_info = ""
+    if s.get("next_milestone"):
+        m    = s["next_milestone"]
+        days = s["milestones"][m]
+        need = m - s["rewarded"]
+        next_info = f"\n🎯 *Next Milestone:* {need} more referral(s) = *{days} days free premium!*"
+
+    await update.message.reply_text(
+        f"👥 *Your Referral Stats*\n\n"
+        f"🔗 *Total Referred:* {s['total']}\n"
+        f"✅ *Verified (Rewarded):* {s['rewarded']}\n"
+        f"⏳ *Pending Verification:* {s['pending']}"
+        + next_info +
+        f"\n\n*Your Referral Link:*\n`{ref_url}`",
+        parse_mode="Markdown",
+    )
+
+
+async def cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/cancel — Cancel pending payments."""
+    user_id = update.effective_user.id
+    if is_banned(user_id):
+        return
+
+    count = cancel_payment(user_id)
+    if count:
+        await update.message.reply_text(
+            f"✅ *{count} pending payment(s) cancelled.*\n\n"
+            "_You can submit a new payment anytime with /paid._",
+            parse_mode="Markdown",
+        )
+    else:
+        await update.message.reply_text(
+            "ℹ️ *No pending payments found.*",
+            parse_mode="Markdown",
+        )
+
+
+async def topfiles_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/topfiles — Admin: top 10 most viewed files."""
+    if not _is_admin(update.effective_user.id):
+        return
+
+    files = get_top_files(10)
+    if not files:
+        await update.message.reply_text("No files found.", parse_mode="Markdown")
+        return
+
+    lines = ["📊 *Top 10 Files*\n"]
+    for i, f in enumerate(files, 1):
+        uid    = f.get("unique_id", "?")
+        views  = f.get("views", 0)
+        media  = len(f.get("media", []))
+        lines.append(f"{i}. `{uid}` — 👁 {views} views | 📎 {media} files")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def extend_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/extend — Admin: manually extend premium. Usage: /extend <user_id> <days>"""
+    if not _is_admin(update.effective_user.id):
+        return
+
+    if len(context.args) < 2 or not context.args[0].isdigit() or not context.args[1].isdigit():
+        await update.message.reply_text(
+            "⚠️ *Usage:* `/extend <user_id> <days>`",
+            parse_mode="Markdown",
+        )
+        return
+
+    target_id = int(context.args[0])
+    days      = int(context.args[1])
+    until     = extend_premium(target_id, days)
+
+    await update.message.reply_text(
+        f"✅ *Premium Extended*\n\n"
+        f"👤 User: `{target_id}`\n"
+        f"➕ Added: {days} days\n"
+        f"📅 Valid until: {until.strftime('%d %b %Y')}",
+        parse_mode="Markdown",
+    )
+    try:
+        await context.bot.send_message(
+            chat_id=target_id,
+            text=(
+                f"🎁 *Premium Extended!*\n\n"
+                f"*+{days} days have been added to your Premium.*\n\n"
+                f"📅 *Valid until:* {until.strftime('%d %b %Y')}"
+            ),
+            parse_mode="Markdown",
+        )
+    except Exception:
+        pass
+
+
+async def viral_share_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/share <unique_id> — Get 24h access by sharing a file."""
+    user_id = update.effective_user.id
+    if is_banned(user_id):
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "⚠️ *Usage:* `/share <file_id>`\n\n"
+            "_Share a file and get 24h free access!_",
+            parse_mode="Markdown",
+        )
+        return
+
+    applied = use_viral_share(user_id)
+    uid     = context.args[0]
+    share_url = f"https://t.me/{BOT_USERNAME}?start=file_{uid}"
+
+    if applied:
+        await update.message.reply_text(
+            "✅ *Share Reward Activated!*\n\n"
+            "*You got 24-hour free access for sharing!*\n\n"
+            f"🔗 Share this link:\n`{share_url}`\n\n"
+            "_Tap to copy and share with friends._",
+            parse_mode="Markdown",
+        )
+    else:
+        await update.message.reply_text(
+            "ℹ️ *Already shared today.*\n\n"
+            f"🔗 Your link:\n`{share_url}`\n\n"
+            "_You can share again tomorrow for another reward._",
+            parse_mode="Markdown",
+        )
+
+
 # ─── Startup ──────────────────────────────────────────────────────────────────
 
 async def register_handlers() -> None:
@@ -1232,6 +1470,12 @@ async def register_handlers() -> None:
     bot_app.add_handler(CommandHandler("ban", ban_handler))
     bot_app.add_handler(CommandHandler("unban", unban_handler))
     bot_app.add_handler(CommandHandler("filestats", filestats_handler))
+    bot_app.add_handler(CommandHandler("trial", trial_handler))
+    bot_app.add_handler(CommandHandler("myreferrals", myreferrals_handler))
+    bot_app.add_handler(CommandHandler("cancel", cancel_handler))
+    bot_app.add_handler(CommandHandler("topfiles", topfiles_handler))
+    bot_app.add_handler(CommandHandler("extend", extend_handler))
+    bot_app.add_handler(CommandHandler("share", viral_share_handler))
     bot_app.add_handler(CallbackQueryHandler(callback_handler))
 
     file_filter = filters.Document.ALL | filters.VIDEO | filters.AUDIO | filters.PHOTO
@@ -1268,6 +1512,48 @@ async def startup() -> None:
     await register_handlers()
     await set_webhook()
     logger.info("Bot is live and ready.")
+
+
+# ─── Daily Report Thread ─────────────────────────────────────────────────────
+
+def daily_report_thread() -> None:
+    """Send daily stats report to all admins at midnight."""
+    while True:
+        # Sleep until next midnight
+        now      = datetime.now(timezone.utc)
+        midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        from datetime import timedelta
+        next_midnight = midnight + timedelta(days=1)
+        sleep_secs = (next_midnight - now).total_seconds()
+        time.sleep(sleep_secs)
+
+        try:
+            r = get_daily_report()
+            report_text = (
+                f"📊 *Daily Report — {r['date']}*\n\n"
+                f"👥 *New Users:* {r['new_users']}\n"
+                f"💎 *New Premium:* {r['new_premium']}\n"
+                f"💰 *New Payments:* {r['new_payments']}\n"
+                f"📁 *Files Accessed:* {r['files_accessed']}\n"
+                f"🔐 *Active Premium:* {r['active_premium']}\n"
+                f"👤 *Total Users:* {r['total_users']}"
+            )
+            for admin_id in ADMIN_IDS:
+                fut = asyncio.run_coroutine_threadsafe(
+                    bot_app.bot.send_message(
+                        chat_id=admin_id,
+                        text=report_text,
+                        parse_mode="Markdown",
+                    ),
+                    _event_loop,
+                )
+                try:
+                    fut.result(timeout=10)
+                except Exception:
+                    pass
+            logger.info("[REPORT] Daily report sent to %d admins", len(ADMIN_IDS))
+        except Exception as exc:
+            logger.warning("[REPORT] Daily report failed: %s", exc)
 
 
 # ─── Premium Expiry Warning Thread ──────────────────────────────────────────
@@ -1359,6 +1645,9 @@ def main() -> None:
 
     threading.Thread(target=premium_expiry_warning_thread, daemon=True).start()
     logger.info("Premium expiry warning thread started OK")
+
+    threading.Thread(target=daily_report_thread, daemon=True).start()
+    logger.info("Daily report thread started OK")
 
     port = int(os.environ.get("PORT", 8080))
     logger.info("Starting Flask on port %d ...", port)
