@@ -68,6 +68,32 @@ from db import (
     get_top_files,
     get_daily_report,
     extend_premium,
+    get_users_expiring_in,
+    mark_reminder_sent,
+    reminder_already_sent,
+    set_file_price,
+    get_file_price,
+    has_paid_for_file,
+    record_file_purchase,
+    get_coins,
+    add_coins,
+    spend_coins,
+    daily_checkin,
+    COIN_REWARDS,
+    COINS_FOR_ACCESS,
+    save_bookmark,
+    get_bookmarks,
+    remove_bookmark,
+    check_ip_rate,
+    set_forward_protection,
+    get_forward_protection,
+    get_revenue_stats,
+    log_event,
+    get_user_journey,
+    schedule_broadcast,
+    get_pending_broadcasts,
+    mark_broadcast_done,
+    mark_broadcast_retry,
 )
 from helpers import extract_unique_id, generate_link, generate_shortlink
 from dotenv import load_dotenv
@@ -383,18 +409,21 @@ async def send_file_with_fallback(
                 entry, _ = batch[0]
                 fid   = entry["file_id"]
                 ftype = entry.get("file_type", "document")
+                protect = get_forward_protection()
                 if ftype == "video":
-                    msgs = [await context.bot.send_video(chat_id=chat_id, video=fid)]
+                    msgs = [await context.bot.send_video(chat_id=chat_id, video=fid, protect_content=protect)]
                 elif ftype == "photo":
-                    msgs = [await context.bot.send_photo(chat_id=chat_id, photo=fid)]
+                    msgs = [await context.bot.send_photo(chat_id=chat_id, photo=fid, protect_content=protect)]
                 elif ftype == "audio":
-                    msgs = [await context.bot.send_audio(chat_id=chat_id, audio=fid)]
+                    msgs = [await context.bot.send_audio(chat_id=chat_id, audio=fid, protect_content=protect)]
                 else:
-                    msgs = [await context.bot.send_document(chat_id=chat_id, document=fid)]
+                    msgs = [await context.bot.send_document(chat_id=chat_id, document=fid, protect_content=protect)]
             else:
+                protect = get_forward_protection()
                 msgs = await context.bot.send_media_group(
                     chat_id=chat_id,
                     media=input_media,
+                    protect_content=protect,
                 )
 
             sent_message_ids.extend([m.message_id for m in msgs])
@@ -519,6 +548,7 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         # Give User 2 (this user) their 24h access
         verify_user(user_id)
         upsert_user(user_id, first_name=user.first_name or "")
+        log_event(user_id, "verified")
         logger.info("[ACCESS] Verification complete | user_id=%s", user_id)
 
         verify_text = (
@@ -608,6 +638,24 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                     return
             except Exception as exc:
                 logger.warning("[FORCE_JOIN] Check failed: %s", exc)
+
+        # Check if file has a price and user hasn't paid
+        file_price = get_file_price(unique_id)
+        if file_price > 0 and not is_premium(user_id) and not has_paid_for_file(user_id, unique_id):
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton(f"💳 Unlock for ₹{file_price}", callback_data=f"buynow_{unique_id}_{file_price}")
+            ]])
+            await update.message.reply_text(
+                f"🔒 *Paid Content*\n\n"
+                f"*This file costs ₹{file_price} to access.*\n\n"
+                f"📲 Pay to UPI: `{UPI_ID}`\n"
+                f"Then send: `/paid <UTR> file_{unique_id}`\n\n"
+                f"_Or get Premium for unlimited access: /buy_",
+                parse_mode="Markdown",
+                reply_markup=keyboard,
+            )
+            log_event(user_id, "paid_file_blocked", {"unique_id": unique_id, "price": file_price})
+            return
 
         # Priority 1 — Premium user → direct access
         if is_premium(user_id):
@@ -959,6 +1007,16 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             parse_mode="Markdown",
         )
 
+    # ── Paid File Purchase ────────────────────────────────────────────────────
+    elif data.startswith("buynow_"):
+        parts    = data.split("_", 2)
+        uid      = parts[1]
+        price    = parts[2] if len(parts) > 2 else "?"
+        await query.answer(
+            f"Pay ₹{price} to {UPI_ID}\nThen send: /paid <UTR> file_{uid}",
+            show_alert=True,
+        )
+
     # ── Buy Plan Info (show UPI for chosen plan) ─────────────────────────────
     elif data.startswith("buy_plan_"):
         plan = data.replace("buy_plan_", "")
@@ -1027,6 +1085,10 @@ def file_redirect(unique_id: str) -> Response:
 
     user_agent = request.headers.get("User-Agent")
     ip         = request.remote_addr
+
+    # IP rate limiting
+    if check_ip_rate(ip, max_per_min=30):
+        return make_response("Too many requests", 429)
 
     # Anti-bot: block requests with no User-Agent
     if not user_agent:
@@ -1168,6 +1230,12 @@ async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "🔹 /trial — 2-hour free trial (once)\n"
         "🔹 /share <id> — Share file, get 24h free\n"
         "🔹 /cancel — Cancel pending payment\n"
+        "🔹 /checkin — Daily coins reward\n"
+        "🔹 /coins — Your coin balance\n"
+        "🔹 /redeem — Spend coins for 24h access\n"
+        "🔹 /save <id> — Bookmark a file\n"
+        "🔹 /mysaved — View bookmarks\n"
+        "🔹 /unsave <id> — Remove bookmark\n"
         "🔹 /status — Check your access status\n"
         "🔹 /help — Show this message"
         + admin_section,
@@ -1456,6 +1524,297 @@ async def viral_share_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
 
 
+
+# ─── Coins + Checkin + Bookmark + Admin Tools ─────────────────────────────────
+
+async def checkin_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/checkin — Daily coin reward."""
+    user_id = update.effective_user.id
+    if is_banned(user_id):
+        return
+
+    applied, earned = daily_checkin(user_id)
+    balance = get_coins(user_id)
+
+    if applied:
+        log_event(user_id, "daily_checkin", {"earned": earned})
+        await update.message.reply_text(
+            f"✅ *Daily Check-in!*\n\n"
+            f"🪙 *+{earned} coins earned!*\n"
+            f"💰 *Balance:* {balance} coins\n\n"
+            f"_Come back tomorrow for more!_\n"
+            f"_{COINS_FOR_ACCESS} coins = 24h free access (/redeem)_",
+            parse_mode="Markdown",
+        )
+    else:
+        await update.message.reply_text(
+            f"⏰ *Already checked in today!*\n\n"
+            f"💰 *Balance:* {balance} coins\n\n"
+            f"_Come back tomorrow!_",
+            parse_mode="Markdown",
+        )
+
+
+async def coins_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/coins — Show coin balance."""
+    user_id = update.effective_user.id
+    if is_banned(user_id):
+        return
+    balance = get_coins(user_id)
+    await update.message.reply_text(
+        f"🪙 *Your Coins*\n\n"
+        f"💰 *Balance:* {balance} coins\n\n"
+        f"*Earn coins:*\n"
+        f"📅 /checkin — +{COIN_REWARDS['daily_checkin']} daily\n"
+        f"👥 Referral verified — +{COIN_REWARDS['referral']}\n"
+        f"🔗 /share — +{COIN_REWARDS['share']}\n\n"
+        f"*Spend:*\n"
+        f"🔓 /redeem — {COINS_FOR_ACCESS} coins = 24h access",
+        parse_mode="Markdown",
+    )
+
+
+async def redeem_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/redeem — Spend coins for 24h access."""
+    user_id = update.effective_user.id
+    if is_banned(user_id):
+        return
+
+    balance = get_coins(user_id)
+    if balance < COINS_FOR_ACCESS:
+        await update.message.reply_text(
+            f"❌ *Not Enough Coins*\n\n"
+            f"💰 *Your balance:* {balance} coins\n"
+            f"🎯 *Required:* {COINS_FOR_ACCESS} coins\n\n"
+            f"_Earn more with /checkin and /share!_",
+            parse_mode="Markdown",
+        )
+        return
+
+    spent = spend_coins(user_id, COINS_FOR_ACCESS, "24h_access")
+    if spent:
+        verify_user(user_id)
+        log_event(user_id, "redeem_coins", {"spent": COINS_FOR_ACCESS})
+        await update.message.reply_text(
+            f"🎉 *Access Unlocked!*\n\n"
+            f"✅ *{COINS_FOR_ACCESS} coins spent*\n"
+            f"🔓 *24-hour access activated!*\n\n"
+            f"💰 *Remaining:* {balance - COINS_FOR_ACCESS} coins",
+            parse_mode="Markdown",
+        )
+
+
+async def save_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/save <unique_id> — Bookmark a file."""
+    user_id = update.effective_user.id
+    if is_banned(user_id):
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "⚠️ *Usage:* `/save <unique_id>`", parse_mode="Markdown")
+        return
+
+    uid     = context.args[0]
+    applied = save_bookmark(user_id, uid)
+    if applied:
+        await update.message.reply_text(
+            f"🔖 *Saved!*\n\n`{uid}` added to your bookmarks.\n"
+            f"_View with /mysaved_",
+            parse_mode="Markdown",
+        )
+    else:
+        await update.message.reply_text(
+            f"ℹ️ `{uid}` is already in your bookmarks.",
+            parse_mode="Markdown",
+        )
+
+
+async def mysaved_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/mysaved — Show bookmarked files."""
+    user_id = update.effective_user.id
+    if is_banned(user_id):
+        return
+
+    bookmarks = get_bookmarks(user_id)
+    if not bookmarks:
+        await update.message.reply_text(
+            "📂 *No bookmarks yet.*\n\n_Use /save <id> to bookmark files._",
+            parse_mode="Markdown",
+        )
+        return
+
+    lines = ["🔖 *Your Saved Files*\n"]
+    for uid in bookmarks:
+        link = f"https://t.me/{BOT_USERNAME}?start=file_{uid}"
+        lines.append(f"• `{uid}` — [Open]({link})")
+
+    await update.message.reply_text(
+        "\n".join(lines),
+        parse_mode="Markdown",
+        disable_web_page_preview=True,
+    )
+
+
+async def unsave_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/unsave <unique_id> — Remove bookmark."""
+    user_id = update.effective_user.id
+    if is_banned(user_id):
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "⚠️ *Usage:* `/unsave <unique_id>`", parse_mode="Markdown")
+        return
+
+    uid     = context.args[0]
+    removed = remove_bookmark(user_id, uid)
+    if removed:
+        await update.message.reply_text(
+            f"✅ `{uid}` removed from bookmarks.", parse_mode="Markdown")
+    else:
+        await update.message.reply_text(
+            f"❌ `{uid}` not found in your bookmarks.", parse_mode="Markdown")
+
+
+async def revenue_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/revenue — Admin revenue dashboard."""
+    if not _is_admin(update.effective_user.id):
+        return
+
+    r = get_revenue_stats()
+    plan_lines = ""
+    for plan, count in r.get("plan_counts", {}).items():
+        prices = {"7": 19, "30": 49, "90": 99}
+        plan_lines += f"  • {plan}-day plan: {count} sales\n"
+
+    await update.message.reply_text(
+        f"💰 *Revenue Dashboard*\n\n"
+        f"📅 *Today:* ₹{r.get('today', 0)}\n"
+        f"📆 *This Week:* ₹{r.get('week', 0)}\n"
+        f"🗓 *This Month:* ₹{r.get('month', 0)}\n"
+        f"💎 *All Time:* ₹{r.get('total', 0)}\n\n"
+        f"📊 *Plan Breakdown:*\n{plan_lines}\n"
+        f"⏳ *Pending Payments:* {r.get('pending_count', 0)}",
+        parse_mode="Markdown",
+    )
+
+
+async def journey_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/journey <user_id> — Admin: view user journey."""
+    if not _is_admin(update.effective_user.id):
+        return
+
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text(
+            "⚠️ *Usage:* `/journey <user_id>`", parse_mode="Markdown")
+        return
+
+    uid    = int(context.args[0])
+    events = get_user_journey(uid)
+    if not events:
+        await update.message.reply_text("No events found.", parse_mode="Markdown")
+        return
+
+    lines = [f"🗺 *User Journey — {uid}*\n"]
+    for e in events:
+        ts     = e.get("timestamp")
+        time_s = ts.strftime("%d/%m %H:%M") if ts else "?"
+        action = e.get("action", "?")
+        meta   = e.get("meta", {})
+        detail = f" ({', '.join(f'{k}={v}' for k, v in meta.items())})" if meta else ""
+        lines.append(f"`{time_s}` — {action}{detail}")
+
+    await update.message.reply_text(
+        "\n".join(lines[:25]), parse_mode="Markdown")
+
+
+async def setprice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/setprice <unique_id> <price> — Admin: set file price."""
+    if not _is_admin(update.effective_user.id):
+        return
+
+    if len(context.args) < 2 or not context.args[1].isdigit():
+        await update.message.reply_text(
+            "⚠️ *Usage:* `/setprice <unique_id> <price>`\n"
+            "_Use price 0 to make it free again._",
+            parse_mode="Markdown",
+        )
+        return
+
+    uid   = context.args[0]
+    price = int(context.args[1])
+    set_file_price(uid, price)
+    label = f"₹{price}" if price > 0 else "Free"
+    await update.message.reply_text(
+        f"✅ *Price Set*\n\n`{uid}` → *{label}*",
+        parse_mode="Markdown",
+    )
+
+
+async def protect_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/protect on|off — Admin: toggle forward protection."""
+    if not _is_admin(update.effective_user.id):
+        return
+
+    if not context.args or context.args[0].lower() not in ("on", "off"):
+        await update.message.reply_text(
+            "⚠️ *Usage:* `/protect on` or `/protect off`",
+            parse_mode="Markdown",
+        )
+        return
+
+    enabled = context.args[0].lower() == "on"
+    set_forward_protection(enabled)
+    status = "✅ Enabled" if enabled else "❌ Disabled"
+    await update.message.reply_text(
+        f"🛡 *Forward Protection {status}*\n\n"
+        f"_All new file deliveries will {'prevent' if enabled else 'allow'} forwarding._",
+        parse_mode="Markdown",
+    )
+
+
+async def schedule_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/schedule <DD/MM/YYYY HH:MM> <message> — Schedule a broadcast."""
+    if not _is_admin(update.effective_user.id):
+        return
+
+    if len(context.args) < 3:
+        await update.message.reply_text(
+            "⚠️ *Usage:* `/schedule DD/MM/YYYY HH:MM Your message here`\n\n"
+            "_Example: /schedule 25/12/2024 10:00 Merry Christmas!_",
+            parse_mode="Markdown",
+        )
+        return
+
+    date_str = context.args[0]
+    time_str = context.args[1]
+    message  = " ".join(context.args[2:])
+
+    try:
+        from datetime import timedelta
+        dt_naive = datetime.strptime(f"{date_str} {time_str}", "%d/%m/%Y %H:%M")
+        dt_utc   = dt_naive.replace(tzinfo=timezone.utc)
+        if dt_utc <= datetime.now(tz=timezone.utc):
+            await update.message.reply_text(
+                "❌ Scheduled time is in the past!", parse_mode="Markdown")
+            return
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Invalid date format. Use DD/MM/YYYY HH:MM",
+            parse_mode="Markdown",
+        )
+        return
+
+    doc_id = schedule_broadcast(message, dt_utc, update.effective_user.id)
+    await update.message.reply_text(
+        f"✅ *Broadcast Scheduled*\n\n"
+        f"📅 *Time:* {date_str} {time_str} UTC\n"
+        f"💬 *Message:* {message[:50]}{'...' if len(message) > 50 else ''}\n\n"
+        f"_ID: `{doc_id}`_",
+        parse_mode="Markdown",
+    )
+
 # ─── Startup ──────────────────────────────────────────────────────────────────
 
 async def register_handlers() -> None:
@@ -1476,6 +1835,17 @@ async def register_handlers() -> None:
     bot_app.add_handler(CommandHandler("topfiles", topfiles_handler))
     bot_app.add_handler(CommandHandler("extend", extend_handler))
     bot_app.add_handler(CommandHandler("share", viral_share_handler))
+    bot_app.add_handler(CommandHandler("checkin", checkin_handler))
+    bot_app.add_handler(CommandHandler("coins", coins_handler))
+    bot_app.add_handler(CommandHandler("redeem", redeem_handler))
+    bot_app.add_handler(CommandHandler("save", save_handler))
+    bot_app.add_handler(CommandHandler("mysaved", mysaved_handler))
+    bot_app.add_handler(CommandHandler("unsave", unsave_handler))
+    bot_app.add_handler(CommandHandler("revenue", revenue_handler))
+    bot_app.add_handler(CommandHandler("journey", journey_handler))
+    bot_app.add_handler(CommandHandler("setprice", setprice_handler))
+    bot_app.add_handler(CommandHandler("protect", protect_handler))
+    bot_app.add_handler(CommandHandler("schedule", schedule_handler))
     bot_app.add_handler(CallbackQueryHandler(callback_handler))
 
     file_filter = filters.Document.ALL | filters.VIDEO | filters.AUDIO | filters.PHOTO
@@ -1602,6 +1972,107 @@ def premium_expiry_warning_thread() -> None:
             logger.warning("[PREMIUM] Expiry warning thread error: %s", exc)
 
 
+# ─── Subscription Reminder Thread ───────────────────────────────────────────
+
+def subscription_reminder_thread() -> None:
+    """Check hourly and send premium expiry reminders."""
+    while True:
+        time.sleep(3600)  # every hour
+        try:
+            # 7-day warning
+            for doc in get_users_expiring_in(hours_min=0, hours_max=168):  # 0-7 days
+                uid  = doc.get("user_id")
+                vunt = doc.get("valid_until")
+                if not uid or not vunt:
+                    continue
+                if vunt.tzinfo is None:
+                    vunt = vunt.replace(tzinfo=timezone.utc)
+                from datetime import timedelta
+                now       = datetime.now(timezone.utc)
+                days_left = (vunt - now).days
+
+                if days_left <= 1 and not reminder_already_sent(uid, "1d"):
+                    msg = ("⚠️ *Premium Expiring Tomorrow!*\n\n"
+                           "*Your premium expires in less than 24 hours.*\n\n"
+                           "_Use /buy now to renew!_")
+                    rtype = "1d"
+                elif days_left <= 3 and not reminder_already_sent(uid, "3d"):
+                    msg = (f"⏰ *Premium Expiring in {days_left} Days*\n\n"
+                           "_Renew with /buy to avoid interruption!_")
+                    rtype = "3d"
+                elif days_left <= 7 and not reminder_already_sent(uid, "7d"):
+                    msg = (f"💡 *Premium Expiring in {days_left} Days*\n\n"
+                           "_Plan ahead and renew with /buy!_")
+                    rtype = "7d"
+                else:
+                    continue
+
+                fut = asyncio.run_coroutine_threadsafe(
+                    bot_app.bot.send_message(chat_id=uid, text=msg, parse_mode="Markdown"),
+                    _event_loop,
+                )
+                try:
+                    fut.result(timeout=10)
+                    mark_reminder_sent(uid, rtype)
+                    logger.info("[REMINDER] Sent %s reminder to user_id=%s", rtype, uid)
+                except Exception as exc:
+                    logger.warning("[REMINDER] Failed for user_id=%s: %s", uid, exc)
+        except Exception as exc:
+            logger.warning("[REMINDER] Thread error: %s", exc)
+
+
+# ─── Scheduled Broadcast Thread ───────────────────────────────────────────────
+
+def scheduled_broadcast_thread() -> None:
+    """Check every minute for pending broadcasts and send them with smart retry."""
+    while True:
+        time.sleep(60)
+        try:
+            pending = get_pending_broadcasts()
+            for doc in pending:
+                doc_id  = str(doc["_id"])
+                message = doc["message"]
+                user_ids = get_all_user_ids()
+                sent = failed = 0
+
+                for uid in user_ids:
+                    fut = asyncio.run_coroutine_threadsafe(
+                        bot_app.bot.send_message(chat_id=uid, text=message),
+                        _event_loop,
+                    )
+                    try:
+                        fut.result(timeout=8)
+                        sent += 1
+                    except Exception:
+                        failed += 1
+
+                if failed > sent * 0.5 and doc.get("retries", 0) < 2:
+                    # More than 50% failed — retry later
+                    mark_broadcast_retry(doc_id)
+                    logger.warning("[SCHEDULE] Broadcast %s had high failures (%d/%d) — will retry",
+                                   doc_id, failed, sent + failed)
+                else:
+                    mark_broadcast_done(doc_id, sent, failed)
+                    logger.info("[SCHEDULE] Broadcast %s done | sent=%d failed=%d", doc_id, sent, failed)
+
+                    # Notify admin
+                    for admin_id in ADMIN_IDS:
+                        try:
+                            asyncio.run_coroutine_threadsafe(
+                                bot_app.bot.send_message(
+                                    chat_id=admin_id,
+                                    text=(f"📤 *Scheduled Broadcast Sent*\n\n"
+                                          f"✅ Sent: {sent}\n❌ Failed: {failed}"),
+                                    parse_mode="Markdown",
+                                ),
+                                _event_loop,
+                            ).result(timeout=10)
+                        except Exception:
+                            pass
+        except Exception as exc:
+            logger.warning("[SCHEDULE] Thread error: %s", exc)
+
+
 # ─── Daily Cleanup Thread ────────────────────────────────────────────────────
 
 def daily_cleanup() -> None:
@@ -1648,6 +2119,12 @@ def main() -> None:
 
     threading.Thread(target=daily_report_thread, daemon=True).start()
     logger.info("Daily report thread started OK")
+
+    threading.Thread(target=subscription_reminder_thread, daemon=True).start()
+    logger.info("Subscription reminder thread started OK")
+
+    threading.Thread(target=scheduled_broadcast_thread, daemon=True).start()
+    logger.info("Scheduled broadcast thread started OK")
 
     port = int(os.environ.get("PORT", 8080))
     logger.info("Starting Flask on port %d ...", port)
