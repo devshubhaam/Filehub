@@ -1419,3 +1419,85 @@ def mark_broadcast_retry(doc_id) -> None:
             "$set": {"last_retry": datetime.now(tz=timezone.utc)},
         },
     )
+
+
+# ─── Shortlink Earnings Tracker ───────────────────────────────────────────────
+
+# CPM rate from Linkshortify (earnings per 1000 clicks)
+# Update this in .env as SHORTLINK_CPM (default ₹40 per 1000 clicks)
+
+def track_shortlink_click(user_id: int, unique_id: str) -> None:
+    """
+    Record every shortlink verification click.
+    Called when user completes verify_access_ flow.
+    """
+    if _db is None:
+        return
+    now = datetime.now(tz=timezone.utc)
+    _db["shortlink_clicks"].insert_one({
+        "user_id":   user_id,
+        "unique_id": unique_id,
+        "timestamp": now,
+        "date":      now.strftime("%Y-%m-%d"),
+    })
+    logger.info("[SHORTLINK] Click tracked | user_id=%s | unique_id=%s", user_id, unique_id)
+
+
+def get_shortlink_stats(days: int = 1) -> dict:
+    """
+    Return shortlink click stats for last N days.
+    Estimates earnings based on CPM rate.
+    """
+    if _db is None:
+        return {}
+
+    import os as _os
+    from datetime import timedelta
+    cpm     = float(_os.environ.get("SHORTLINK_CPM", "40"))  # ₹ per 1000 clicks
+    now     = datetime.now(tz=timezone.utc)
+    since   = now - timedelta(days=days)
+    today   = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    total_clicks = _db["shortlink_clicks"].count_documents(
+        {"timestamp": {"$gte": since}}
+    )
+    today_clicks = _db["shortlink_clicks"].count_documents(
+        {"timestamp": {"$gte": today}}
+    )
+
+    # Unique users today
+    pipeline = [
+        {"$match": {"timestamp": {"$gte": today}}},
+        {"$group": {"_id": "$user_id"}},
+        {"$count": "unique"},
+    ]
+    result       = list(_db["shortlink_clicks"].aggregate(pipeline))
+    unique_today = result[0]["unique"] if result else 0
+
+    # Per-day breakdown for last N days
+    daily = []
+    for i in range(days):
+        day_start = today - timedelta(days=i)
+        day_end   = day_start + timedelta(days=1)
+        count = _db["shortlink_clicks"].count_documents({
+            "timestamp": {"$gte": day_start, "$lt": day_end}
+        })
+        daily.append({
+            "date":     day_start.strftime("%d %b"),
+            "clicks":   count,
+            "earnings": round(count * cpm / 1000, 2),
+        })
+
+    total_estimated = round(total_clicks * cpm / 1000, 2)
+    today_estimated = round(today_clicks * cpm / 1000, 2)
+
+    return {
+        "today_clicks":    today_clicks,
+        "today_unique":    unique_today,
+        "today_estimated": today_estimated,
+        "total_clicks":    total_clicks,
+        "total_estimated": total_estimated,
+        "cpm":             cpm,
+        "days":            days,
+        "daily":           daily,
+    }
