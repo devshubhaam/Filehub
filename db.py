@@ -729,3 +729,290 @@ def get_all_user_ids() -> list[int]:
     if _db is None:
         raise RuntimeError("Database not initialised — call init_db() first.")
     return [d["user_id"] for d in _db["users"].find({}, {"user_id": 1})]
+
+# ─── Multi-Plan Premium ───────────────────────────────────────────────────────
+
+PREMIUM_PLANS = {
+    "7":  {"days": 7,  "amount": 19,  "label": "⚡ 7 Days"},
+    "30": {"days": 30, "amount": 49,  "label": "💎 30 Days"},
+    "90": {"days": 90, "amount": 99,  "label": "👑 90 Days"},
+}
+
+
+def submit_payment_plan(user_id: int, utr: str, plan: str = "30") -> str:
+    """Store payment with plan info. Returns 'ok' or 'duplicate'."""
+    if _db is None:
+        raise RuntimeError("Database not initialised — call init_db() first.")
+
+    if _db["payments"].find_one({"utr": utr}):
+        return "duplicate"
+
+    now = datetime.now(tz=timezone.utc)
+    _db["payments"].insert_one({
+        "user_id":   user_id,
+        "utr":       utr,
+        "plan":      plan,
+        "status":    "pending",
+        "timestamp": now,
+    })
+    logger.info("[PAYMENT] Submitted | user_id=%s | utr=%s | plan=%s", user_id, utr, plan)
+    return "ok"
+
+
+def approve_payment_plan(user_id: int, utr: str) -> int:
+    """Approve payment, grant premium based on plan. Returns days granted."""
+    if _db is None:
+        raise RuntimeError("Database not initialised — call init_db() first.")
+
+    from datetime import timedelta
+    now = datetime.now(tz=timezone.utc)
+
+    doc = _db["payments"].find_one({"user_id": user_id, "utr": utr})
+    plan = doc.get("plan", "30") if doc else "30"
+    days = PREMIUM_PLANS.get(plan, PREMIUM_PLANS["30"])["days"]
+
+    # Extend existing premium if active
+    existing = _db["premium_users"].find_one({"user_id": user_id})
+    if existing:
+        current = existing.get("valid_until", now)
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=timezone.utc)
+        base = max(current, now)  # extend from current expiry
+    else:
+        base = now
+
+    valid_until = base + timedelta(days=days)
+
+    _db["payments"].update_one(
+        {"user_id": user_id, "utr": utr},
+        {"$set": {"status": "approved", "approved_at": now}},
+    )
+    _db["premium_users"].update_one(
+        {"user_id": user_id},
+        {"$set": {"user_id": user_id, "valid_until": valid_until, "plan": plan}},
+        upsert=True,
+    )
+    logger.info("[PREMIUM] Approved %d days | user_id=%s | until=%s", days, user_id, valid_until.isoformat())
+    return days
+
+
+# ─── Free Trial ───────────────────────────────────────────────────────────────
+
+def use_free_trial(user_id: int) -> bool:
+    """
+    Give user 2-hour free access. One-time only.
+    Returns True if trial applied, False if already used.
+    """
+    if _db is None:
+        raise RuntimeError("Database not initialised — call init_db() first.")
+
+    if _db["trials"].find_one({"user_id": user_id}):
+        return False
+
+    now = datetime.now(tz=timezone.utc)
+    _db["trials"].insert_one({"user_id": user_id, "used_at": now})
+
+    # Give 2 hours verified access
+    trial_until = now
+    from datetime import timedelta
+    trial_at = now - timedelta(hours=22)  # 24h - 22h = 2h remaining
+    _db["verified_users"].update_one(
+        {"user_id": user_id},
+        {"$set": {"user_id": user_id, "verified_at": trial_at}},
+        upsert=True,
+    )
+    logger.info("[TRIAL] Free trial granted | user_id=%s", user_id)
+    return True
+
+
+# ─── Referral Milestone Rewards ──────────────────────────────────────────────
+
+REFERRAL_MILESTONES = {3: 7, 10: 30}  # referrals: premium days
+
+
+def check_referral_milestone(referrer_id: int) -> int | None:
+    """
+    Check if referrer hit a milestone (3 or 10 successful referrals).
+    Returns days of premium to grant, or None if no milestone hit.
+    """
+    if _db is None:
+        return None
+
+    count = _db["referrals"].count_documents({
+        "referrer_id": referrer_id,
+        "rewarded": True,
+    })
+
+    # Check if this exact count is a milestone (not already rewarded)
+    if count in REFERRAL_MILESTONES:
+        milestone_key = f"milestone_{count}"
+        already = _db["referral_milestones"].find_one({
+            "user_id": referrer_id, "milestone": count
+        })
+        if not already:
+            days = REFERRAL_MILESTONES[count]
+            from datetime import timedelta
+            now = datetime.now(tz=timezone.utc)
+            existing = _db["premium_users"].find_one({"user_id": referrer_id})
+            if existing:
+                current = existing.get("valid_until", now)
+                if current.tzinfo is None:
+                    current = current.replace(tzinfo=timezone.utc)
+                base = max(current, now)
+            else:
+                base = now
+            valid_until = base + timedelta(days=days)
+            _db["premium_users"].update_one(
+                {"user_id": referrer_id},
+                {"$set": {"user_id": referrer_id, "valid_until": valid_until}},
+                upsert=True,
+            )
+            _db["referral_milestones"].insert_one({
+                "user_id": referrer_id, "milestone": count, "days": days, "at": now
+            })
+            logger.info("[REFERRAL] Milestone %d hit | user_id=%s | +%d days premium",
+                        count, referrer_id, days)
+            return days
+    return None
+
+
+# ─── Viral Share ──────────────────────────────────────────────────────────────
+
+def use_viral_share(sharer_id: int) -> bool:
+    """
+    Give 24h access when user shares a file link.
+    One reward per user per day.
+    """
+    if _db is None:
+        return False
+
+    from datetime import timedelta
+    now   = datetime.now(tz=timezone.utc)
+    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    already = _db["viral_shares"].find_one({
+        "user_id":  sharer_id,
+        "shared_at": {"$gte": today},
+    })
+    if already:
+        return False
+
+    _db["viral_shares"].insert_one({"user_id": sharer_id, "shared_at": now})
+    _db["verified_users"].update_one(
+        {"user_id": sharer_id},
+        {"$set": {"user_id": sharer_id, "verified_at": now}},
+        upsert=True,
+    )
+    logger.info("[VIRAL] Share reward | user_id=%s", sharer_id)
+    return True
+
+
+# ─── Myreferrals ─────────────────────────────────────────────────────────────
+
+def get_referral_stats(user_id: int) -> dict:
+    """Return referral stats for a user."""
+    if _db is None:
+        return {}
+
+    total    = _db["referrals"].count_documents({"referrer_id": user_id})
+    rewarded = _db["referrals"].count_documents({"referrer_id": user_id, "rewarded": True})
+    pending  = total - rewarded
+    next_milestone = None
+    for m in sorted(REFERRAL_MILESTONES.keys()):
+        if rewarded < m:
+            next_milestone = m
+            break
+    return {
+        "total":          total,
+        "rewarded":       rewarded,
+        "pending":        pending,
+        "next_milestone": next_milestone,
+        "milestones":     REFERRAL_MILESTONES,
+    }
+
+
+# ─── Cancel Payment ───────────────────────────────────────────────────────────
+
+def cancel_payment(user_id: int) -> int:
+    """Cancel all pending payments for a user. Returns count cancelled."""
+    if _db is None:
+        return 0
+
+    now    = datetime.now(tz=timezone.utc)
+    result = _db["payments"].update_many(
+        {"user_id": user_id, "status": "pending"},
+        {"$set": {"status": "cancelled", "cancelled_at": now}},
+    )
+    logger.info("[PAYMENT] Cancelled %d payments for user_id=%s", result.modified_count, user_id)
+    return result.modified_count
+
+
+# ─── Top Files ────────────────────────────────────────────────────────────────
+
+def get_top_files(limit: int = 10) -> list:
+    """Return top files sorted by views."""
+    if _db is None:
+        return []
+
+    return list(_db["files"].find(
+        {"unique_id": {"$exists": True}},
+        {"unique_id": 1, "views": 1, "media": 1, "created_at": 1},
+    ).sort("views", -1).limit(limit))
+
+
+# ─── Daily Report ─────────────────────────────────────────────────────────────
+
+def get_daily_report() -> dict:
+    """Stats for the last 24 hours."""
+    if _db is None:
+        return {}
+
+    from datetime import timedelta
+    now      = datetime.now(tz=timezone.utc)
+    since    = now - timedelta(hours=24)
+
+    new_users    = _db["users"].count_documents({"first_seen": {"$gte": since}})
+    new_premium  = _db["payments"].count_documents({"status": "approved", "approved_at": {"$gte": since}})
+    new_payments = _db["payments"].count_documents({"timestamp": {"$gte": since}})
+    files_accessed = _db["verified_users"].count_documents({"verified_at": {"$gte": since}})
+    active_premium = _db["premium_users"].count_documents({"valid_until": {"$gt": now}})
+    total_users    = _db["users"].count_documents({})
+
+    return {
+        "new_users":      new_users,
+        "new_premium":    new_premium,
+        "new_payments":   new_payments,
+        "files_accessed": files_accessed,
+        "active_premium": active_premium,
+        "total_users":    total_users,
+        "date":           now.strftime("%d %b %Y"),
+    }
+
+
+# ─── Extend Premium ───────────────────────────────────────────────────────────
+
+def extend_premium(user_id: int, days: int) -> datetime:
+    """Extend premium by days from current expiry or now."""
+    if _db is None:
+        raise RuntimeError("Database not initialised — call init_db() first.")
+
+    from datetime import timedelta
+    now      = datetime.now(tz=timezone.utc)
+    existing = _db["premium_users"].find_one({"user_id": user_id})
+
+    if existing:
+        current = existing.get("valid_until", now)
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=timezone.utc)
+        base = max(current, now)
+    else:
+        base = now
+
+    valid_until = base + timedelta(days=days)
+    _db["premium_users"].update_one(
+        {"user_id": user_id},
+        {"$set": {"user_id": user_id, "valid_until": valid_until}},
+        upsert=True,
+    )
+    logger.info("[PREMIUM] Extended +%d days | user_id=%s | until=%s", days, user_id, valid_until.isoformat())
+    return valid_until
