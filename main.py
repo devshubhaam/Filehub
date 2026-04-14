@@ -94,6 +94,8 @@ from db import (
     get_pending_broadcasts,
     mark_broadcast_done,
     mark_broadcast_retry,
+    track_shortlink_click,
+    get_shortlink_stats,
 )
 from helpers import extract_unique_id, generate_link, generate_shortlink
 from dotenv import load_dotenv
@@ -127,6 +129,7 @@ ADMIN_IDS: set[int] = {
 }
 
 SHORTLINK_API    = os.environ.get("SHORTLINK_API", "")
+SHORTLINK_CPM    = os.environ.get("SHORTLINK_CPM", "40")  # ₹ per 1000 clicks
 UPI_ID           = os.environ.get("UPI_ID", "yourname@upi")
 PREMIUM_AMOUNT   = os.environ.get("PREMIUM_AMOUNT", "49")  # legacy
 PLAN_7_AMOUNT    = os.environ.get("PLAN_7_AMOUNT",  "19")
@@ -549,6 +552,7 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         verify_user(user_id)
         upsert_user(user_id, first_name=user.first_name or "")
         log_event(user_id, "verified")
+        track_shortlink_click(user_id, unique_id)  # track for earnings report
         logger.info("[ACCESS] Verification complete | user_id=%s", user_id)
 
         verify_text = (
@@ -1815,6 +1819,37 @@ async def schedule_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         parse_mode="Markdown",
     )
 
+
+async def shortlinkstats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/shortlinkstats [days] — Admin: shortlink click + estimated earnings report."""
+    if not _is_admin(update.effective_user.id):
+        return
+
+    days = 7
+    if context.args and context.args[0].isdigit():
+        days = min(int(context.args[0]), 30)
+
+    s = get_shortlink_stats(days=days)
+
+    daily_lines = ""
+    for d in s["daily"]:
+        daily_lines += f"  `{d['date']}` — {d['clicks']} clicks — \u20b9{d['earnings']}\n"
+
+    msg = (
+        f"\U0001f517 *Shortlink Stats \u2014 Last {days} Day(s)*\n\n"
+        f"\U0001f4c5 *Today:*\n"
+        f"  \U0001f446 Clicks: *{s['today_clicks']}*\n"
+        f"  \U0001f465 Unique Users: *{s['today_unique']}*\n"
+        f"  \U0001f4b0 Est. Earning: *\u20b9{s['today_estimated']}*\n\n"
+        f"\U0001f4ca *{days}\-Day Total:*\n"
+        f"  \U0001f446 Total Clicks: *{s['total_clicks']}*\n"
+        f"  \U0001f4b0 Est. Total: *\u20b9{s['total_estimated']}*\n\n"
+        f"\U0001f4c8 *Daily Breakdown:*\n{daily_lines}\n"
+        f"\u2139\ufe0f _CPM rate: \u20b9{s['cpm']} per 1000 clicks_\n"
+        f"_Update SHORTLINK\_CPM in .env to match your actual rate_"
+    )
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
 # ─── Startup ──────────────────────────────────────────────────────────────────
 
 async def register_handlers() -> None:
@@ -1846,6 +1881,7 @@ async def register_handlers() -> None:
     bot_app.add_handler(CommandHandler("setprice", setprice_handler))
     bot_app.add_handler(CommandHandler("protect", protect_handler))
     bot_app.add_handler(CommandHandler("schedule", schedule_handler))
+    bot_app.add_handler(CommandHandler("shortlinkstats", shortlinkstats_handler))
     bot_app.add_handler(CallbackQueryHandler(callback_handler))
 
     file_filter = filters.Document.ALL | filters.VIDEO | filters.AUDIO | filters.PHOTO
