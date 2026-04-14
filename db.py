@@ -1016,3 +1016,406 @@ def extend_premium(user_id: int, days: int) -> datetime:
     )
     logger.info("[PREMIUM] Extended +%d days | user_id=%s | until=%s", days, user_id, valid_until.isoformat())
     return valid_until
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# NEW FEATURES — Subscription Reminders, Coins, Bookmarks, Paid Files,
+#                Revenue, Analytics, Scheduled Broadcast, Forward Protection
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ─── Subscription Reminders ───────────────────────────────────────────────────
+
+def get_users_expiring_in(hours_min: int, hours_max: int) -> list[dict]:
+    """
+    Return premium users expiring between hours_min and hours_max from now.
+    Used for reminder system.
+    """
+    if _db is None:
+        return []
+    from datetime import timedelta
+    now       = datetime.now(tz=timezone.utc)
+    from_dt   = now + timedelta(hours=hours_min)
+    to_dt     = now + timedelta(hours=hours_max)
+    return list(_db["premium_users"].find({
+        "valid_until": {"$gte": from_dt, "$lt": to_dt}
+    }))
+
+
+def mark_reminder_sent(user_id: int, reminder_type: str) -> None:
+    """Mark that a reminder was sent so we don't send it again."""
+    if _db is None:
+        return
+    _db["reminder_log"].update_one(
+        {"user_id": user_id, "type": reminder_type},
+        {"$set": {"user_id": user_id, "type": reminder_type,
+                  "sent_at": datetime.now(tz=timezone.utc)}},
+        upsert=True,
+    )
+
+
+def reminder_already_sent(user_id: int, reminder_type: str) -> bool:
+    """Check if reminder was already sent this cycle."""
+    if _db is None:
+        return False
+    from datetime import timedelta
+    now   = datetime.now(tz=timezone.utc)
+    since = now - timedelta(days=2)
+    return _db["reminder_log"].find_one({
+        "user_id": user_id,
+        "type":    reminder_type,
+        "sent_at": {"$gte": since},
+    }) is not None
+
+
+# ─── Paid File Access ─────────────────────────────────────────────────────────
+
+def set_file_price(unique_id: str, price: int) -> None:
+    """Set a per-file price in rupees. 0 = free."""
+    if _db is None:
+        return
+    get_files_collection().update_one(
+        {"unique_id": unique_id},
+        {"$set": {"price": price}},
+    )
+    logger.info("[PRICE] Set price=%d for unique_id=%s", price, unique_id)
+
+
+def get_file_price(unique_id: str) -> int:
+    """Return file price. 0 = free."""
+    if _db is None:
+        return 0
+    doc = get_files_collection().find_one({"unique_id": unique_id}, {"price": 1})
+    return doc.get("price", 0) if doc else 0
+
+
+def has_paid_for_file(user_id: int, unique_id: str) -> bool:
+    """Check if user has already paid for this specific file."""
+    if _db is None:
+        return False
+    return _db["file_purchases"].find_one(
+        {"user_id": user_id, "unique_id": unique_id}
+    ) is not None
+
+
+def record_file_purchase(user_id: int, unique_id: str, amount: int) -> None:
+    """Record a file purchase after admin approval."""
+    if _db is None:
+        return
+    now = datetime.now(tz=timezone.utc)
+    _db["file_purchases"].insert_one({
+        "user_id":   user_id,
+        "unique_id": unique_id,
+        "amount":    amount,
+        "paid_at":   now,
+    })
+    logger.info("[FILE-PURCHASE] user_id=%s bought unique_id=%s for ₹%d",
+                user_id, unique_id, amount)
+
+
+# ─── Coins System ─────────────────────────────────────────────────────────────
+
+COIN_REWARDS = {
+    "daily_checkin": 10,
+    "referral":      50,
+    "share":         20,
+    "purchase":      5,
+}
+COINS_FOR_ACCESS = 100  # coins needed for 24h access
+
+
+def get_coins(user_id: int) -> int:
+    """Return user's coin balance."""
+    if _db is None:
+        return 0
+    doc = _db["coins"].find_one({"user_id": user_id}, {"balance": 1})
+    return doc.get("balance", 0) if doc else 0
+
+
+def add_coins(user_id: int, amount: int, reason: str) -> int:
+    """Add coins to user balance. Returns new balance."""
+    if _db is None:
+        return 0
+    now = datetime.now(tz=timezone.utc)
+    result = _db["coins"].find_one_and_update(
+        {"user_id": user_id},
+        {
+            "$inc": {"balance": amount},
+            "$push": {"transactions": {"amount": amount, "reason": reason, "at": now}},
+        },
+        upsert=True,
+        return_document=True,
+    )
+    balance = result.get("balance", amount) if result else amount
+    logger.info("[COINS] +%d to user_id=%s (%s) | balance=%d", amount, user_id, reason, balance)
+    return balance
+
+
+def spend_coins(user_id: int, amount: int, reason: str) -> bool:
+    """
+    Spend coins from balance. Returns True if successful, False if insufficient.
+    """
+    if _db is None:
+        return False
+    doc = _db["coins"].find_one({"user_id": user_id})
+    balance = doc.get("balance", 0) if doc else 0
+    if balance < amount:
+        return False
+    now = datetime.now(tz=timezone.utc)
+    _db["coins"].update_one(
+        {"user_id": user_id},
+        {
+            "$inc": {"balance": -amount},
+            "$push": {"transactions": {"amount": -amount, "reason": reason, "at": now}},
+        },
+    )
+    logger.info("[COINS] -%d from user_id=%s (%s) | was=%d", amount, user_id, reason, balance)
+    return True
+
+
+def daily_checkin(user_id: int) -> tuple[bool, int]:
+    """
+    Daily check-in. Returns (applied: bool, coins_earned: int).
+    Only once per calendar day.
+    """
+    if _db is None:
+        return False, 0
+    from datetime import timedelta
+    now   = datetime.now(tz=timezone.utc)
+    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    already = _db["checkins"].find_one({
+        "user_id":    user_id,
+        "checked_in": {"$gte": today},
+    })
+    if already:
+        return False, 0
+    earned = COIN_REWARDS["daily_checkin"]
+    _db["checkins"].insert_one({"user_id": user_id, "checked_in": now})
+    new_balance = add_coins(user_id, earned, "daily_checkin")
+    return True, earned
+
+
+# ─── Bookmarks ────────────────────────────────────────────────────────────────
+
+def save_bookmark(user_id: int, unique_id: str) -> bool:
+    """Save a file bookmark. Returns False if already saved."""
+    if _db is None:
+        return False
+    existing = _db["bookmarks"].find_one(
+        {"user_id": user_id, "unique_id": unique_id}
+    )
+    if existing:
+        return False
+    _db["bookmarks"].insert_one({
+        "user_id":   user_id,
+        "unique_id": unique_id,
+        "saved_at":  datetime.now(tz=timezone.utc),
+    })
+    logger.info("[BOOKMARK] user_id=%s saved unique_id=%s", user_id, unique_id)
+    return True
+
+
+def get_bookmarks(user_id: int) -> list[str]:
+    """Return list of bookmarked unique_ids for user."""
+    if _db is None:
+        return []
+    docs = list(_db["bookmarks"].find(
+        {"user_id": user_id},
+        {"unique_id": 1},
+    ).sort("saved_at", -1).limit(20))
+    return [d["unique_id"] for d in docs]
+
+
+def remove_bookmark(user_id: int, unique_id: str) -> bool:
+    """Remove a bookmark. Returns True if removed."""
+    if _db is None:
+        return False
+    result = _db["bookmarks"].delete_one({"user_id": user_id, "unique_id": unique_id})
+    return result.deleted_count > 0
+
+
+# ─── IP Rate Limiting ─────────────────────────────────────────────────────────
+
+_ip_requests: dict = {}
+
+
+def check_ip_rate(ip: str, max_per_min: int = 30) -> bool:
+    """
+    Return True if IP is rate-limited (too many requests).
+    Cleans old timestamps automatically.
+    """
+    import time as _time
+    now    = _time.time()
+    window = now - 60
+
+    if ip not in _ip_requests:
+        _ip_requests[ip] = []
+
+    _ip_requests[ip] = [ts for ts in _ip_requests[ip] if ts > window]
+
+    if len(_ip_requests[ip]) >= max_per_min:
+        logger.warning("[IP-LIMIT] IP %s exceeded %d req/min", ip, max_per_min)
+        return True
+
+    _ip_requests[ip].append(now)
+    return False
+
+
+# ─── Forward Protection Settings ─────────────────────────────────────────────
+
+def set_forward_protection(enabled: bool) -> None:
+    """Global forward protection toggle stored in DB config."""
+    if _db is None:
+        return
+    _db["config"].update_one(
+        {"key": "forward_protection"},
+        {"$set": {"key": "forward_protection", "value": enabled}},
+        upsert=True,
+    )
+    logger.info("[PROTECT] Forward protection set to %s", enabled)
+
+
+def get_forward_protection() -> bool:
+    """Return True if forward protection is enabled."""
+    if _db is None:
+        return False
+    doc = _db["config"].find_one({"key": "forward_protection"})
+    return doc.get("value", False) if doc else False
+
+
+# ─── Revenue Dashboard ────────────────────────────────────────────────────────
+
+def get_revenue_stats() -> dict:
+    """Aggregate revenue from approved payments."""
+    if _db is None:
+        return {}
+    from datetime import timedelta
+    now   = datetime.now(tz=timezone.utc)
+    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    week  = now - timedelta(days=7)
+    month = now - timedelta(days=30)
+
+    def _sum_revenue(query: dict) -> int:
+        pipeline = [
+            {"$match": {**query, "status": "approved"}},
+            {"$lookup": {
+                "from":         "payments",
+                "localField":   "utr",
+                "foreignField": "utr",
+                "as":           "pay",
+            }},
+        ]
+        total = 0
+        plan_prices = {"7": 19, "30": 49, "90": 99}
+        docs = list(_db["payments"].find({**query, "status": "approved"}))
+        for d in docs:
+            total += plan_prices.get(d.get("plan", "30"), 49)
+        return total
+
+    today_rev = _sum_revenue({"approved_at": {"$gte": today}})
+    week_rev  = _sum_revenue({"approved_at": {"$gte": week}})
+    month_rev = _sum_revenue({"approved_at": {"$gte": month}})
+    total_rev = _sum_revenue({})
+
+    # Plan breakdown
+    plan_counts = {}
+    for plan in ("7", "30", "90"):
+        plan_counts[plan] = _db["payments"].count_documents(
+            {"status": "approved", "plan": plan}
+        )
+
+    pending_count = _db["payments"].count_documents({"status": "pending"})
+
+    return {
+        "today":         today_rev,
+        "week":          week_rev,
+        "month":         month_rev,
+        "total":         total_rev,
+        "plan_counts":   plan_counts,
+        "pending_count": pending_count,
+    }
+
+
+# ─── User Journey / Event Tracking ────────────────────────────────────────────
+
+def log_event(user_id: int, action: str, meta: dict | None = None) -> None:
+    """Log a user action event for analytics."""
+    if _db is None:
+        return
+    _db["events"].insert_one({
+        "user_id":   user_id,
+        "action":    action,
+        "meta":      meta or {},
+        "timestamp": datetime.now(tz=timezone.utc),
+    })
+
+
+def get_user_journey(user_id: int, limit: int = 20) -> list[dict]:
+    """Return recent events for a user."""
+    if _db is None:
+        return []
+    return list(_db["events"].find(
+        {"user_id": user_id},
+        {"action": 1, "meta": 1, "timestamp": 1},
+    ).sort("timestamp", -1).limit(limit))
+
+
+# ─── Scheduled Broadcast ─────────────────────────────────────────────────────
+
+def schedule_broadcast(message: str, scheduled_at: datetime, admin_id: int) -> str:
+    """Schedule a broadcast message. Returns doc ID."""
+    if _db is None:
+        return ""
+    result = _db["scheduled_broadcasts"].insert_one({
+        "message":      message,
+        "scheduled_at": scheduled_at,
+        "admin_id":     admin_id,
+        "status":       "pending",
+        "created_at":   datetime.now(tz=timezone.utc),
+        "sent_count":   0,
+        "fail_count":   0,
+        "retries":      0,
+    })
+    logger.info("[SCHEDULE] Broadcast scheduled at %s by admin=%s",
+                scheduled_at.isoformat(), admin_id)
+    return str(result.inserted_id)
+
+
+def get_pending_broadcasts() -> list[dict]:
+    """Return broadcasts due to be sent now."""
+    if _db is None:
+        return []
+    now = datetime.now(tz=timezone.utc)
+    return list(_db["scheduled_broadcasts"].find({
+        "status":       "pending",
+        "scheduled_at": {"$lte": now},
+        "retries":      {"$lt": 3},
+    }))
+
+
+def mark_broadcast_done(doc_id, sent: int, failed: int) -> None:
+    """Mark a scheduled broadcast as completed."""
+    if _db is None:
+        return
+    from bson import ObjectId
+    _db["scheduled_broadcasts"].update_one(
+        {"_id": ObjectId(doc_id)},
+        {"$set": {
+            "status":     "done",
+            "sent_count": sent,
+            "fail_count": failed,
+            "done_at":    datetime.now(tz=timezone.utc),
+        }},
+    )
+
+
+def mark_broadcast_retry(doc_id) -> None:
+    """Increment retry count for a failed broadcast."""
+    if _db is None:
+        return
+    from bson import ObjectId
+    _db["scheduled_broadcasts"].update_one(
+        {"_id": ObjectId(doc_id)},
+        {
+            "$inc": {"retries": 1},
+            "$set": {"last_retry": datetime.now(tz=timezone.utc)},
+        },
+    )
