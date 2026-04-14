@@ -221,22 +221,23 @@ async def _handle_file_upload(
     file_id: str,
     caption: str | None,
     source: str = "admin",
+    source_file_type: str = "document",
 ) -> None:
     """
     Core upload flow (admin + channel):
       1. Extract/generate unique_id from caption
-      2. Save file_id to MongoDB
+      2. Save file_id + type to MongoDB
       3. Generate permanent link
       4. Reply to admin / log for channel
     """
     unique_id  = extract_unique_id(caption)
-    result     = save_file(unique_id, file_id)
+    result     = save_file(unique_id, file_id, file_type=source_file_type)
     # Use domain redirect URL — bot can be swapped by changing BOT_USERNAME in .env
     link       = f"{WEBHOOK_URL}/file/{unique_id}"
 
     status_map = {
         "inserted": "New file saved",
-        "updated":  "New backup added to existing file",
+        "updated":  "Media added to album",
         "exists":   "File already exists (no change)",
     }
     status_msg = status_map.get(result, result)
@@ -248,7 +249,7 @@ async def _handle_file_upload(
         f"✅ *File Saved!*\n\n"
         f"🆔 *Unique ID*\n"
         f"`{unique_id}`\n\n"
-        f"📊 *Status:* _{status_msg}_\n\n"
+        f"📊 *Status:* _{status_msg}_\n"
         f"🔗 *Permanent Link*\n"
         f"{link}\n\n"
         f"💡 _Share this link to give access to the file._"
@@ -268,21 +269,20 @@ async def send_file_with_fallback(
     unique_id: str,
 ) -> None:
     """
-    Deliver a file to the user using the self-healing fallback system.
+    Deliver ALL media files for a unique_id as an album (Option A).
 
-    Algorithm:
-      For each file_id in DB (in order):
-        - Try to send
-        - Success → increment views, log, stop
-        - Failure → log dead ID, remove from DB, try next
-      All failed → notify user
+    - Fetches all media entries from DB
+    - Sends them together as a Telegram media group
+    - Dead file_ids are removed on failure
+    - Auto-deletes all sent messages after 10 minutes
     """
+    from telegram import InputMediaVideo, InputMediaPhoto, InputMediaDocument, InputMediaAudio
+
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
 
-    # 1. Fetch document from DB
+    # 1. Fetch document
     doc = get_file(unique_id)
-
     if not doc:
         logger.warning("[DELIVERY] unique_id=%s not found | user_id=%s", unique_id, user_id)
         await update.message.reply_text(
@@ -293,116 +293,156 @@ async def send_file_with_fallback(
         )
         return
 
-    file_ids: list[str] = list(doc.get("file_ids", []))
+    # Support both new `media` list and legacy `file_ids`
+    raw_media = doc.get("media", [])
+    if not raw_media:
+        # Backward compat: legacy file_ids treated as documents
+        raw_media = [
+            {"file_id": fid, "file_type": "document"}
+            for fid in doc.get("file_ids", [])
+        ]
 
-    if not file_ids:
-        logger.warning("[DELIVERY] unique_id=%s has no file_ids | user_id=%s", unique_id, user_id)
+    if not raw_media:
+        logger.warning("[DELIVERY] unique_id=%s has no media | user_id=%s", unique_id, user_id)
         await update.message.reply_text(
             "⚠️ *File Unavailable*\n\n"
-            "*No sources are currently available for this file.*\n\n"
+            "*No media available for this file.*\n\n"
             "_Please contact the admin for assistance._",
             parse_mode="Markdown",
         )
         return
 
     logger.info(
-        "[DELIVERY] Starting delivery: unique_id=%s | %d file_id(s) | user_id=%s",
-        unique_id, len(file_ids), user_id,
+        "[DELIVERY] Starting album delivery: unique_id=%s | %d item(s) | user_id=%s",
+        unique_id, len(raw_media), user_id,
     )
 
-    # 2. Try each file_id
-    sent = False
-    for index, file_id in enumerate(file_ids):
+    # 2. Build InputMedia list — remove dead entries as we go
+    def _make_input(entry: dict):
+        fid   = entry["file_id"]
+        ftype = entry.get("file_type", "document")
+        if ftype == "video":
+            return InputMediaVideo(media=fid)
+        elif ftype == "photo":
+            return InputMediaPhoto(media=fid)
+        elif ftype == "audio":
+            return InputMediaAudio(media=fid)
+        else:
+            return InputMediaDocument(media=fid)
+
+    # Try to send in batches of 10 (Telegram album limit)
+    DELETE_AFTER   = 600
+    sent_message_ids = []
+    total_sent     = 0
+    dead_ids       = []
+
+    # First pass — validate all file_ids
+    valid_media = []
+    for entry in raw_media:
         try:
-            sent_msg = await context.bot.send_document(
-                chat_id=chat_id,
-                document=file_id,
-            )
+            im = _make_input(entry)
+            valid_media.append((entry, im))
+        except Exception as exc:
+            logger.warning("[SELF-HEAL] Bad media entry: %s | %s", entry, exc)
+            dead_ids.append(entry["file_id"])
 
-            # Success
-            label = "primary" if index == 0 else f"fallback (index={index})"
+    if not valid_media:
+        await update.message.reply_text(
+            "❌ *Delivery Failed*\n\n"
+            "_All media entries are invalid. Please contact admin._",
+            parse_mode="Markdown",
+        )
+        return
+
+    # Send in chunks of 10
+    batch_size = 10
+    for i in range(0, len(valid_media), batch_size):
+        batch = valid_media[i:i + batch_size]
+        input_media = [im for _, im in batch]
+
+        try:
+            if len(input_media) == 1:
+                # Single file — use appropriate send method
+                entry, _ = batch[0]
+                fid   = entry["file_id"]
+                ftype = entry.get("file_type", "document")
+                if ftype == "video":
+                    msgs = [await context.bot.send_video(chat_id=chat_id, video=fid)]
+                elif ftype == "photo":
+                    msgs = [await context.bot.send_photo(chat_id=chat_id, photo=fid)]
+                elif ftype == "audio":
+                    msgs = [await context.bot.send_audio(chat_id=chat_id, audio=fid)]
+                else:
+                    msgs = [await context.bot.send_document(chat_id=chat_id, document=fid)]
+            else:
+                msgs = await context.bot.send_media_group(
+                    chat_id=chat_id,
+                    media=input_media,
+                )
+
+            sent_message_ids.extend([m.message_id for m in msgs])
+            total_sent += len(msgs)
             logger.info(
-                "[DELIVERY] Sent via %s | unique_id=%s | user_id=%s",
-                label, unique_id, user_id,
+                "[DELIVERY] Album batch %d sent | %d items | unique_id=%s | user_id=%s",
+                i // batch_size + 1, len(msgs), unique_id, user_id,
             )
-
-            # Increment analytics counter
-            increment_views(unique_id)
-
-            # Send auto-delete notice
-            notice_msg = await context.bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    "⏳ *Auto-Delete Active*\n\n"
-                    "*This file will be deleted in 10 minutes.*\n\n"
-                    "_Save it now before the timer runs out!_"
-                ),
-                parse_mode="Markdown",
-            )
-
-            # Schedule deletion of both file + notice after 600 seconds
-            DELETE_AFTER = 600
-            async def _delete_messages(
-                bot,
-                cid: int,
-                file_message_id: int,
-                notice_message_id: int,
-            ) -> None:
-                await asyncio.sleep(DELETE_AFTER)
-                for mid in (file_message_id, notice_message_id):
-                    try:
-                        await bot.delete_message(chat_id=cid, message_id=mid)
-                        logger.info(
-                            "[AUTO-DELETE] Deleted message_id=%s | chat_id=%s",
-                            mid, cid,
-                        )
-                    except Exception as del_exc:
-                        logger.warning(
-                            "[AUTO-DELETE] Could not delete message_id=%s: %s",
-                            mid, del_exc,
-                        )
-
-            asyncio.ensure_future(
-                _delete_messages(
-                    context.bot,
-                    chat_id,
-                    sent_msg.message_id,
-                    notice_msg.message_id,
-                ),
-                loop=_event_loop,
-            )
-            logger.info(
-                "[AUTO-DELETE] Scheduled deletion in %ds | chat_id=%s",
-                DELETE_AFTER, chat_id,
-            )
-
-            sent = True
-            break
 
         except Exception as exc:
             logger.warning(
-                "[SELF-HEAL] Dead file_id detected (index=%d) | unique_id=%s | error=%s",
-                index, unique_id, exc,
+                "[SELF-HEAL] Album batch failed | unique_id=%s | error=%s",
+                unique_id, exc,
             )
-            remove_file_id(unique_id, file_id)
-            logger.info(
-                "[SELF-HEAL] Dead file_id removed from DB | unique_id=%s",
-                unique_id,
-            )
+            # Mark all in this batch as dead
+            for entry, _ in batch:
+                dead_ids.append(entry["file_id"])
 
-    # 3. All failed
-    if not sent:
-        logger.error(
-            "[DELIVERY] All file_ids exhausted | unique_id=%s | user_id=%s",
-            unique_id, user_id,
-        )
+    # Remove dead file_ids
+    for dead_id in dead_ids:
+        remove_file_id(unique_id, dead_id)
+        logger.info("[SELF-HEAL] Removed dead file_id=%s | unique_id=%s", dead_id, unique_id)
+
+    if total_sent == 0:
         await update.message.reply_text(
             "❌ *Delivery Failed*\n\n"
-            "*Unable to deliver this file right now.*\n\n"
-            "_All backup sources have been exhausted._\n"
+            "*Unable to deliver the files right now.*\n\n"
             "_Please contact the admin or try again later._",
             parse_mode="Markdown",
         )
+        return
+
+    # 3. Increment views
+    increment_views(unique_id)
+
+    # 4. Send auto-delete notice
+    notice_msg = await context.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            f"⏳ *Auto-Delete Active*\n\n"
+            f"*{total_sent} file(s) will be deleted in 10 minutes.*\n\n"
+            "_Save them now before the timer runs out!_"
+        ),
+        parse_mode="Markdown",
+    )
+    sent_message_ids.append(notice_msg.message_id)
+
+    # 5. Schedule deletion of all sent messages
+    async def _delete_all(bot, cid: int, mids: list[int]) -> None:
+        await asyncio.sleep(DELETE_AFTER)
+        for mid in mids:
+            try:
+                await bot.delete_message(chat_id=cid, message_id=mid)
+                logger.info("[AUTO-DELETE] Deleted message_id=%s | chat_id=%s", mid, cid)
+            except Exception as del_exc:
+                logger.warning("[AUTO-DELETE] Could not delete message_id=%s: %s", mid, del_exc)
+
+    asyncio.ensure_future(
+        _delete_all(context.bot, chat_id, sent_message_ids),
+        loop=_event_loop,
+    )
+    logger.info(
+        "[AUTO-DELETE] Scheduled deletion of %d messages in %ds | chat_id=%s",
+        len(sent_message_ids), DELETE_AFTER, chat_id,
+    )
 
 
 # ─── Telegram Handlers ────────────────────────────────────────────────────────
@@ -624,11 +664,13 @@ async def upload_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         file_id, file_type = msg.video.file_id, "video"
     elif msg.audio:
         file_id, file_type = msg.audio.file_id, "audio"
+    elif msg.photo:
+        file_id, file_type = msg.photo[-1].file_id, "photo"
     else:
         return  # unsupported type
 
     logger.info("[UPLOAD] type=%s | user_id=%s | caption=%r", file_type, user.id, caption)
-    await _handle_file_upload(update, context, file_id, caption, source="admin")
+    await _handle_file_upload(update, context, file_id, caption, source="admin", source_file_type=file_type)
 
 
 async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -642,12 +684,14 @@ async def channel_post_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         file_id, file_type = post.video.file_id, "video"
     elif post.audio:
         file_id, file_type = post.audio.file_id, "audio"
+    elif post.photo:
+        file_id, file_type = post.photo[-1].file_id, "photo"
     else:
         return
 
     logger.info("[UPLOAD][channel] type=%s | chat=%s | caption=%r",
                 file_type, post.chat.id, caption)
-    await _handle_file_upload(update, context, file_id, caption, source="channel")
+    await _handle_file_upload(update, context, file_id, caption, source="channel", source_file_type=file_type)
 
 
 
@@ -1190,11 +1234,11 @@ async def register_handlers() -> None:
     bot_app.add_handler(CommandHandler("filestats", filestats_handler))
     bot_app.add_handler(CallbackQueryHandler(callback_handler))
 
-    file_filter = filters.Document.ALL | filters.VIDEO | filters.AUDIO
+    file_filter = filters.Document.ALL | filters.VIDEO | filters.AUDIO | filters.PHOTO
     bot_app.add_handler(MessageHandler(file_filter, upload_handler))
 
     channel_file_filter = (
-        filters.Document.ALL | filters.VIDEO | filters.AUDIO
+        filters.Document.ALL | filters.VIDEO | filters.AUDIO | filters.PHOTO
     ) & filters.ChatType.CHANNEL
     bot_app.add_handler(MessageHandler(channel_file_filter, channel_post_handler))
 
