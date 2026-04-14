@@ -85,45 +85,54 @@ def get_users_collection() -> Collection:
 
 # ─── Files API ────────────────────────────────────────────────────────────────
 
-def save_file(unique_id: str, file_id: str) -> str:
+def save_file(unique_id: str, file_id: str, file_type: str = "document") -> str:
     """
-    Upsert a file record.
+    Upsert a file record supporting multiple media files per unique_id.
+
+    Each entry in `media` list:
+      { "file_id": str, "file_type": "video" | "photo" | "document" | "audio" }
 
     Returns:
       "inserted" — new document created
-      "updated"  — file_id added to existing document
+      "updated"  — file added to existing document
       "exists"   — file_id already present, no change
     """
     col = get_files_collection()
     now = datetime.now(tz=timezone.utc)
 
     existing = col.find_one({"unique_id": unique_id})
+    media_entry = {"file_id": file_id, "file_type": file_type}
 
     if existing:
-        if file_id in existing.get("file_ids", []):
+        # Check duplicate by file_id
+        existing_ids = [m.get("file_id") for m in existing.get("media", [])]
+        # Backward compat — also check legacy file_ids list
+        legacy_ids   = existing.get("file_ids", [])
+        if file_id in existing_ids or file_id in legacy_ids:
             logger.info("file_id already exists for unique_id=%s -- skipping", unique_id)
             return "exists"
 
         col.update_one(
             {"unique_id": unique_id},
             {
-                "$addToSet": {"file_ids": file_id},
-                "$set":      {"updated_at": now},
+                "$push": {"media": media_entry},
+                "$set":  {"updated_at": now},
             },
         )
-        logger.info("Updated unique_id=%s with new file_id OK", unique_id)
+        logger.info("Updated unique_id=%s | added %s file OK", unique_id, file_type)
         return "updated"
 
     col.insert_one(
         {
             "unique_id":  unique_id,
-            "file_ids":   [file_id],
-            "views":      0,            # analytics counter
+            "media":      [media_entry],
+            "file_ids":   [],            # kept for backward compat
+            "views":      0,
             "created_at": now,
             "updated_at": now,
         }
     )
-    logger.info("Inserted new record unique_id=%s OK", unique_id)
+    logger.info("Inserted new record unique_id=%s | type=%s OK", unique_id, file_type)
     return "inserted"
 
 
@@ -132,11 +141,10 @@ def get_file(unique_id: str) -> dict | None:
     col = get_files_collection()
     doc = col.find_one({"unique_id": unique_id})
     if doc:
+        media_count = len(doc.get("media", doc.get("file_ids", [])))
         logger.info(
-            "Found unique_id=%s -- %d file_id(s) | views=%d",
-            unique_id,
-            len(doc.get("file_ids", [])),
-            doc.get("views", 0),
+            "Found unique_id=%s -- %d media item(s) | views=%d",
+            unique_id, media_count, doc.get("views", 0),
         )
     else:
         logger.warning("unique_id=%s not found in DB", unique_id)
@@ -145,30 +153,30 @@ def get_file(unique_id: str) -> dict | None:
 
 def remove_file_id(unique_id: str, file_id: str) -> None:
     """
-    Remove a single dead file_id from the file_ids array.
-    Uses $pull — does not touch other file_ids.
+    Remove a dead media entry by file_id.
+    Works on both new `media` array and legacy `file_ids` array.
     """
     col = get_files_collection()
     now = datetime.now(tz=timezone.utc)
 
-    result = col.update_one(
+    # Remove from new media array
+    r1 = col.update_one(
         {"unique_id": unique_id},
         {
-            "$pull": {"file_ids": file_id},
+            "$pull": {"media": {"file_id": file_id}},
             "$set":  {"updated_at": now},
         },
     )
+    # Also remove from legacy file_ids if present
+    col.update_one(
+        {"unique_id": unique_id},
+        {"$pull": {"file_ids": file_id}},
+    )
 
-    if result.modified_count:
-        logger.info(
-            "[SELF-HEAL] Removed dead file_id from unique_id=%s | file_id=%s",
-            unique_id, file_id,
-        )
+    if r1.modified_count:
+        logger.info("[SELF-HEAL] Removed dead file_id=%s from unique_id=%s", file_id, unique_id)
     else:
-        logger.warning(
-            "[SELF-HEAL] Could not remove file_id — unique_id=%s not found",
-            unique_id,
-        )
+        logger.warning("[SELF-HEAL] file_id=%s not found in unique_id=%s", file_id, unique_id)
 
 
 def increment_views(unique_id: str) -> None:
@@ -622,7 +630,7 @@ def get_file_stats(unique_id: str) -> dict | None:
     return {
         "unique_id":   unique_id,
         "views":       doc.get("views", 0),
-        "file_ids":    len(doc.get("file_ids", [])),
+        "media_count": len(doc.get("media", doc.get("file_ids", []))),
         "created_at":  doc.get("created_at"),
         "updated_at":  doc.get("updated_at"),
     }
