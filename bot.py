@@ -26,7 +26,7 @@ import helpers
 from config import (
     ADMIN_IDS, BOT_TOKENS, BOT_USERNAMES, AUTO_DELETE_MINUTES,
     PREMIUM_PLANS, UPI_ID, UPI_NAME, VERIFICATION_HOURS,
-    FLASK_PORT, WEBHOOK_BASE_URL, FLASK_SECRET,
+    FLASK_PORT, WEBHOOK_BASE_URL, FLASK_SECRET, VERCEL_URL,
     START_MSG, FORCE_VERIFY_MSG, VERIFIED_MSG,
     FILE_AUTO_DELETE_MSG, PREMIUM_MSG,
 )
@@ -75,6 +75,14 @@ async def guard_user(update: Update) -> bool:
     return True
 
 
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+def make_share_link(bot_username: str, unique_id: str) -> str:
+    """Returns Vercel link if configured, else Telegram deep link."""
+    if VERCEL_URL and VERCEL_URL != "https://your-app.vercel.app":
+        return f"{VERCEL_URL.rstrip('/')}/file/{unique_id}"
+    return f"https://t.me/{bot_username}?start=file_{unique_id}"
+
+
 # ─── /start ───────────────────────────────────────────────────────────────────
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -84,8 +92,26 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     args = context.args
+
+    # ✅ Verification callback — user returns after completing shortlink
+    if args and args[0].startswith("verify_"):
+        try:
+            target_user_id = int(args[0][7:])
+        except ValueError:
+            await update.message.reply_text("❌ Invalid verification link.")
+            return
+        await db.set_verified(target_user_id)
+        helpers.verified_cache.set(f"verified_{target_user_id}", True)
+        await update.message.reply_text(
+            "✅ <b>Verification Successful!</b>\n\n"
+            "Ab wapas jao aur <b>✅ I've Verified</b> button dabao — file milegi!",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # ✅ File delivery
     if args and args[0].startswith("file_"):
-        unique_id = args[0][5:]  # strip "file_"
+        unique_id = args[0][5:]
         await deliver_file(update, context, unique_id)
         return
 
@@ -539,16 +565,17 @@ async def upload_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("❌ Failed to save file. Please try again.")
         return
 
-    # Generate link using first bot username
     bot_username = context.bot.username
-    link = helpers.make_file_link(bot_username, unique_id)
+    link = make_share_link(bot_username, unique_id)
+    tg_link = helpers.make_file_link(bot_username, unique_id)
 
     await message.reply_text(
         f"✅ <b>File Uploaded!</b>\n\n"
         f"ID: <code>{unique_id}</code>\n"
         f"Type: {media_info['type']}\n"
         f"Caption: {caption or 'None'}\n\n"
-        f"🔗 <b>Link:</b>\n<code>{link}</code>",
+        f"🔗 <b>Share Link (Vercel):</b>\n<code>{link}</code>\n\n"
+        f"📨 <b>Direct Telegram:</b>\n<code>{tg_link}</code>",
         parse_mode=ParseMode.HTML,
     )
 
@@ -588,12 +615,15 @@ async def batch_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Failed to save batch.")
         return
 
-    link = helpers.make_file_link(context.bot.username, unique_id)
+    bot_username = context.bot.username
+    link = make_share_link(bot_username, unique_id)
+    tg_link = helpers.make_file_link(bot_username, unique_id)
     await update.message.reply_text(
         f"✅ <b>Batch Uploaded!</b>\n\n"
         f"ID: <code>{unique_id}</code>\n"
         f"Files: {len(state['media'])}\n\n"
-        f"🔗 <b>Link:</b>\n<code>{link}</code>",
+        f"🔗 <b>Share Link (Vercel):</b>\n<code>{link}</code>\n\n"
+        f"📨 <b>Direct Telegram:</b>\n<code>{tg_link}</code>",
         parse_mode=ParseMode.HTML,
     )
 
