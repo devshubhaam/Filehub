@@ -1,0 +1,36 @@
+services:
+  - type: web
+    name: filepe-bot
+    env: python
+    region: singapore
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn main:flask_app --workers 2 --worker-class gthread --threads 4 --timeout 120 --bind 0.0.0.0:$PORT
+    envVars:
+      - key: BOT_TOKENS
+        sync: false
+      - key: BOT_USERNAMES
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: MONGO_URI
+        sync: false
+      - key: DB_NAME
+        value: filepe
+      - key: SHORTLINK_API_URL
+        sync: false
+      - key: SHORTLINK_API_KEY
+        sync: false
+      - key: VERIFICATION_HOURS
+        value: "24"
+      - key: UPI_ID
+        sync: false
+      - key: WEBHOOK_BASE_URL
+        sync: false
+      - key: FLASK_SECRET
+        generateValue: true
+      - key: AUTO_DELETE_MINUTES
+        value: "10"
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+    healthCheckPath: /health
